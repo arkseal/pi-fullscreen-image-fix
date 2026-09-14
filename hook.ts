@@ -1,4 +1,8 @@
-import { patchKittyBuffer } from "./patch.ts";
+import {
+  patchKittyBuffer,
+  discoverImageRegionsFromScreen,
+  patchBufferWithRegions,
+} from "./patch.ts";
 import * as fs from "node:fs";
 
 function debugLog(msg: string): void {
@@ -7,19 +11,76 @@ function debugLog(msg: string): void {
   } catch {}
 }
 
+const SYM_RENDER_HOOKED = Symbol.for("pi_kitty_dorender_hooked");
+
 /**
- * Installs a single global process.stdout.write hook that intercepts all terminal
- * output containing Kitty graphics sequences (\x1b_G).
+ * Installs the Kitty image protection fix onto a TuiAltScreen instance.
  *
- * To prevent stale closures and multiple stacked wrappers across `/reload`:
- * 1. Resolves `realStdoutWrite` directly from `Object.getPrototypeOf(process.stdout).write`.
- * 2. Overwrites `process.stdout.write` directly with the fresh module implementation.
- * 3. Handles both string and Buffer chunks seamlessly.
+ * It wraps `tui.doRender()` so that for every render cycle (initial render, active scroll,
+ * or stopped scroll):
+ * 1. It inspects the rendered layout screen lines to find all active Kitty images and their
+ *    exact row extents and column widths.
+ * 2. It wraps `terminal.write` for that single render cycle, rewriting placeholder line erases
+ *    to preserve columns 1..cols while erasing cols+1..mainWidth.
+ * 3. Restores `terminal.write` immediately in a finally block.
+ */
+export function installKittyImageFix(tui: any): () => void {
+  installGlobalStdoutHook();
+
+  if (!tui || typeof tui.doRender !== "function") {
+    return () => {};
+  }
+
+  if (tui[SYM_RENDER_HOOKED]) {
+    return () => {};
+  }
+  tui[SYM_RENDER_HOOKED] = true;
+
+  debugLog("installKittyImageFix: wrapping tui.doRender");
+
+  const originalDoRender = tui.doRender;
+  tui.doRender = function (...args: any[]) {
+    const term = this.terminal;
+    const termCols = term?.columns || 118;
+    const termRows = term?.rows || 39;
+
+    let imageRegions: any[] = [];
+    try {
+      if (typeof this.render === "function") {
+        const screen = this.render(termCols, termRows);
+        if (Array.isArray(screen)) {
+          imageRegions = discoverImageRegionsFromScreen(screen, termRows, termCols);
+        }
+      }
+    } catch {}
+
+    const originalTermWrite = term?.write;
+    if (term && typeof originalTermWrite === "function" && imageRegions.length > 0) {
+      term.write = function (data: any) {
+        if (typeof data === "string") {
+          data = patchBufferWithRegions(data, imageRegions, termCols);
+        }
+        return originalTermWrite.call(this, data);
+      };
+    }
+
+    try {
+      return originalDoRender.apply(this, args);
+    } finally {
+      if (term && typeof originalTermWrite === "function") {
+        term.write = originalTermWrite;
+      }
+    }
+  };
+
+  return () => {};
+}
+
+/**
+ * Fallback stdout hook to catch any stray unintercepted writes containing \x1b_G.
  */
 export function installGlobalStdoutHook(): void {
   const realStdoutWrite = Object.getPrototypeOf(process.stdout).write;
-
-  debugLog("installGlobalStdoutHook: attaching fresh hook to process.stdout.write");
 
   let inHook = false;
   process.stdout.write = function (
@@ -45,17 +106,4 @@ export function installGlobalStdoutHook(): void {
     }
     return realStdoutWrite.call(process.stdout, chunk, encodingOrCallback, callback);
   };
-}
-
-/**
- * Installs the Kitty image protection hook.
- *
- * Ensures the single stdout hook is registered.
- *
- * @param tui The TUI instance
- * @returns A cleanup function
- */
-export function installKittyImageFix(_tui?: any): () => void {
-  installGlobalStdoutHook();
-  return () => {};
 }
