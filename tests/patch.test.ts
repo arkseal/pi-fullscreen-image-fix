@@ -174,10 +174,10 @@ describe("patchKittyBuffer", () => {
     const output = patchKittyBuffer(input, 24);
 
     const afterImage = output.slice(output.indexOf("IMG\x1b\\"));
-    // Row 4 has visible text, so it must be preserved!
-    assert.ok(afterImage.includes("\x1b[4;1H\x1b[2KOverlay Caption"), "Visible text on row 4 must be kept");
-    // Row 5 is empty erase, so it should be suppressed
-    assert.ok(!afterImage.includes("\x1b[5;1H\x1b[2K"), "Empty row 5 must be suppressed after image");
+    // Row 4 has visible text, so it must be preserved (with leading erase stripped)
+    assert.ok(afterImage.includes("\x1b[4;1HOverlay Caption"), "Visible text on row 4 must be kept");
+    // Row 5 is empty erase, so \x1b[2K must be stripped
+    assert.ok(!afterImage.includes("\x1b[5;1H\x1b[2K"), "Empty row 5 erase must be stripped after image");
     assert.ok(afterImage.includes("\x1b[6;1H\x1b[2KNext"), "Row 6 must be kept");
   });
 
@@ -193,7 +193,9 @@ describe("patchKittyBuffer", () => {
     const output = patchKittyBuffer(input, 24);
 
     assert.ok(output.includes("\x1b[5;1H\x1b[2K\x1b[6;1H\x1b[2K\x1b[7;1H\x1b[2K\x1b[5;1H" + chunkedSeq));
-    assert.ok(!output.includes("CHUNK2\x1b\\\x1b[6;1H"));
+    const afterChunk = output.slice(output.indexOf("CHUNK2\x1b\\"));
+    assert.ok(!afterChunk.includes("\x1b[6;1H\x1b[2K"), "Row 6 erase must be stripped");
+    assert.ok(!afterChunk.includes("\x1b[7;1H\x1b[2K"), "Row 7 erase must be stripped");
     assert.ok(output.includes("\x1b[8;1H\x1b[2KAfter"));
   });
 
@@ -209,7 +211,9 @@ describe("patchKittyBuffer", () => {
 
     // Pre-clear should use the \x1b[45X erase command
     assert.ok(output.includes("\x1b[10;1H\x1b[45X\x1b[11;1H\x1b[45X\x1b[12;1H\x1b[45X\x1b[10;1H\x1b_Ga=T,r=3;IMG\x1b\\"));
-    assert.ok(!output.includes("IMG\x1b\\\x1b[11;1H"));
+    const afterImg = output.slice(output.indexOf("IMG\x1b\\"));
+    assert.ok(!afterImg.includes("\x1b[11;1H\x1b[45X"), "Row 11 erase must be stripped");
+    assert.ok(!afterImg.includes("\x1b[12;1H\x1b[45X"), "Row 12 erase must be stripped");
     assert.ok(output.includes("\x1b[13;1H\x1b[45XAfter"));
   });
 

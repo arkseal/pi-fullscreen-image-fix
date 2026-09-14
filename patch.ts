@@ -101,15 +101,7 @@ export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
       const rowNum = parseInt(part.slice(2, -3), 10);
       const nextContent = parts[i + 1] || "";
 
-      // Case 1: We are on a row covered by an active Kitty graphic
-      if (rowNum <= kittyEndRow && isEraseOnly(nextContent)) {
-        // Skip this empty line erase so it doesn't destroy the graphic slice
-        didPatch = true;
-        i++; // skip nextContent
-        continue;
-      }
-
-      // Case 2: Check if nextContent contains a Kitty image placement/transmission
+      // Case 1: Check if nextContent contains a Kitty image placement/transmission
       const rows = extractKittyRows(nextContent);
       if (rows > 1) {
         kittyEndRow = Math.max(kittyEndRow, rowNum + rows - 1);
@@ -132,6 +124,18 @@ export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
 
         didPatch = true;
         stats.imagesPatched++;
+        i++; // consumed nextContent
+        continue;
+      }
+
+      // Case 2: We are on a row covered by an active Kitty graphic
+      if (rowNum <= kittyEndRow) {
+        // Strip the line-erase command so cells and image pixels are not destroyed,
+        // while preserving any styling resets, cursor positioning, or end-of-frame markers.
+        const strippedContent = nextContent.replace(/^\x1b\[(?:[0-2]?K|\d+X)/, "");
+        newParts.push(part);
+        newParts.push(strippedContent);
+        didPatch = true;
         i++; // consumed nextContent
         continue;
       }
