@@ -22,16 +22,25 @@ export function installGlobalStdoutHook(): void {
   debugLog("installGlobalStdoutHook: attaching fresh hook to process.stdout.write");
 
   let inHook = false;
+  let writeCount = 0;
   process.stdout.write = function (
     chunk: any,
     encodingOrCallback?: any,
     callback?: any
   ) {
-    if (!inHook && typeof chunk === "string" && chunk.includes("\x1b_G")) {
+    writeCount++;
+    const str = typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString("utf8") : "";
+    if (writeCount <= 20) {
+      debugLog(`write #${writeCount}: len=${chunk?.length ?? 0} isStr=${typeof chunk === "string"} isBuf=${Buffer.isBuffer(chunk)} preview=${JSON.stringify(str.slice(0, 40))}`);
+    }
+
+    if (!inHook && str.includes("\x1b_G")) {
       inHook = true;
       try {
+        debugLog(`stdout.write intercepted _G, len=${str.length}`);
         const maxRows = process.stdout.rows || 9999;
-        chunk = patchKittyBuffer(chunk, maxRows);
+        const patched = patchKittyBuffer(str, maxRows);
+        chunk = Buffer.isBuffer(chunk) ? Buffer.from(patched, "utf8") : patched;
       } catch (e: any) {
         debugLog(`patchKittyBuffer error: ${e?.message}`);
       } finally {
