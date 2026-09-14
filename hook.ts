@@ -1,9 +1,6 @@
 import { patchKittyBuffer } from "./patch.ts";
 import * as fs from "node:fs";
 
-export const SYM_STDOUT_HOOKED = Symbol.for("pi_kitty_stdout_hooked_v3");
-export const SYM_PATCH_FN = Symbol.for("pi_kitty_patch_fn_v3");
-
 function debugLog(msg: string): void {
   try {
     fs.appendFileSync("/tmp/kitty-fix-debug.log", `[${new Date().toISOString()}] ${msg}\n`);
@@ -14,29 +11,18 @@ function debugLog(msg: string): void {
  * Installs a single global process.stdout.write hook that intercepts all terminal
  * output containing Kitty graphics sequences (\x1b_G).
  *
- * Why hook process.stdout.write exclusively?
- * 1. It is the final chokepoint before bytes hit the terminal emulator.
- * 2. It runs AFTER any extensions (like pi-sidebar-tui) have formatted their erases
- *    and composited their layouts, preventing duplicate patching.
- * 3. It cannot be deleted or bypassed by extensions overriding terminal.write.
- * 4. Using Symbol.for guarantees that subsequent reloads (/reload) seamlessly update
- *    the patching function in-place without stacking multiple hooks.
+ * To prevent stale closures and multiple stacked wrappers across `/reload`:
+ * 1. Resolves `realStdoutWrite` directly from `Object.getPrototypeOf(process.stdout).write`.
+ * 2. Overwrites `process.stdout.write` directly with the fresh module implementation.
+ * 3. Bypasses any previous wrappers so old closures cannot execute.
  */
 export function installGlobalStdoutHook(): void {
-  // Always update the active patch function so the latest version runs after /reload
-  (process.stdout as any)[SYM_PATCH_FN] = patchKittyBuffer;
+  const realStdoutWrite = Object.getPrototypeOf(process.stdout).write;
 
-  if ((process.stdout as any)[SYM_STDOUT_HOOKED]) {
-    return;
-  }
-  (process.stdout as any)[SYM_STDOUT_HOOKED] = true;
+  debugLog("installGlobalStdoutHook: attaching fresh hook to process.stdout.write");
 
-  debugLog("installGlobalStdoutHook: attaching single hook to process.stdout.write");
-
-  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
   let inHook = false;
-
-  (process.stdout as any).write = function (
+  process.stdout.write = function (
     chunk: any,
     encodingOrCallback?: any,
     callback?: any
@@ -44,16 +30,15 @@ export function installGlobalStdoutHook(): void {
     if (!inHook && typeof chunk === "string" && chunk.includes("\x1b_G")) {
       inHook = true;
       try {
-        const patchFn = (process.stdout as any)[SYM_PATCH_FN] || patchKittyBuffer;
         const maxRows = process.stdout.rows || 9999;
-        chunk = patchFn(chunk, maxRows);
+        chunk = patchKittyBuffer(chunk, maxRows);
       } catch (e: any) {
         debugLog(`patchKittyBuffer error: ${e?.message}`);
       } finally {
         inHook = false;
       }
     }
-    return originalStdoutWrite(chunk, encodingOrCallback, callback);
+    return realStdoutWrite.call(process.stdout, chunk, encodingOrCallback, callback);
   };
 }
 

@@ -40,14 +40,23 @@ export const stats: PatchStats = {
 
 /**
  * Extract the number of terminal rows reserved for a Kitty image.
- * Returns 0 if not a Kitty sequence, or >= 1 if r parameter is found.
+ * Inspects all Kitty sequences in the content to find any with an explicit r parameter.
+ * Returns 0 if not a Kitty sequence, or >= 1 if found.
  */
 export function extractKittyRows(content: string): number {
   if (!content || !content.includes("\x1b_G")) return 0;
-  const match = /\x1b_G([^\x1b;]*)(?:;|\x1b\\)/.exec(content);
-  if (!match) return 0;
-  const rMatch = /(?:^|,)r=(\d+)(?:,|$)/.exec(match[1]);
-  return rMatch ? parseInt(rMatch[1], 10) : 1;
+  const regex = /\x1b_G([^\x1b;]*)(?:;|\x1b\\)/g;
+  let m: RegExpExecArray | null;
+  let maxRows = 0;
+  while ((m = regex.exec(content)) !== null) {
+    const rMatch = /(?:^|,)r=(\d+)(?:,|$)/.exec(m[1]);
+    if (rMatch) {
+      maxRows = Math.max(maxRows, parseInt(rMatch[1], 10));
+    } else if (maxRows === 0) {
+      maxRows = 1;
+    }
+  }
+  return maxRows;
 }
 
 /**
