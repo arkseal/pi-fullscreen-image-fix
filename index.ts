@@ -1,9 +1,21 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { installKittyImageFix, SYM_KITTY_FIX_INSTALLED } from "./hook.ts";
+import { installKittyImageFix, installGlobalStdoutHook } from "./hook.ts";
 import { stats } from "./patch.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as zlib from "node:zlib";
+
+function debugLog(msg: string): void {
+  try {
+    fs.appendFileSync("/tmp/kitty-fix-debug.log", `[${new Date().toISOString()}] ${msg}\n`);
+  } catch {}
+}
+
+debugLog("index.ts top-level evaluated");
+
+// Immediately install global stdout hook so terminal writes are protected from the moment
+// this module is loaded, without waiting for session events.
+installGlobalStdoutHook();
 
 function crc32(buf: Buffer): number {
   const table: number[] = [];
@@ -74,27 +86,21 @@ export function generateTestPng(width = 64, height = 64): Buffer {
 }
 
 export default function fullscreenImageFixPlugin(pi: ExtensionAPI) {
-  let activeUninstall: (() => void) | undefined;
-  let isInstalled = false;
+  debugLog("fullscreenImageFixPlugin factory initialized");
+  installGlobalStdoutHook();
 
-  pi.on("session_start", (_event, ctx) => {
-    if (ctx.mode !== "tui") return;
+  const attachTuiWidget = (ctx: any) => {
+    if (ctx?.mode !== "tui" || !ctx?.ui?.setWidget) return;
 
-    // Use setWidget belowEditor to receive the interactive TUI instance
     ctx.ui.setWidget(
       "pi-fullscreen-image-fix",
       (tui: any) => {
         if (tui && tui.mode === "fullscreen") {
-          activeUninstall = installKittyImageFix(tui);
-          isInstalled = true;
+          installKittyImageFix(tui);
         }
 
         return {
-          dispose() {
-            activeUninstall?.();
-            activeUninstall = undefined;
-            isInstalled = false;
-          },
+          dispose() {},
           invalidate() {},
           render(_width: number): string[] {
             return [];
@@ -103,6 +109,17 @@ export default function fullscreenImageFixPlugin(pi: ExtensionAPI) {
       },
       { placement: "belowEditor" }
     );
+  };
+
+  pi.on("session_start", (_event, ctx) => {
+    debugLog("session_start event fired");
+    attachTuiWidget(ctx);
+  });
+
+  // Also ensure widget is attached on tool results, in case the session was already running
+  // when the extension was hot-reloaded
+  pi.on("tool_result", (_event, ctx) => {
+    attachTuiWidget(ctx);
   });
 
   // Diagnostic command
@@ -121,7 +138,7 @@ export default function fullscreenImageFixPlugin(pi: ExtensionAPI) {
 
       const statusMsg = [
         "=== Fullscreen Image Fix Status ===",
-        `Installed: ${isInstalled ? "YES (active)" : "INACTIVE"}`,
+        `Stdout Hook: ACTIVE`,
         `TUI Mode: ${ctx.mode}`,
         `Frames Processed: ${stats.framesProcessed}`,
         `Frames Patched: ${stats.framesPatched}`,

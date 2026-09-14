@@ -79,6 +79,11 @@ export function detectEraseCommand(content: string): string {
 export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
   stats.framesProcessed++;
 
+  try {
+    const fs = require("node:fs");
+    fs.appendFileSync("/tmp/kitty-fix-debug.log", `[${new Date().toISOString()}] patchKittyBuffer called, hasKitty=${buffer.includes("\x1b_G")}, len=${buffer.length}\n`);
+  } catch {}
+
   // Fast path: if no Kitty graphics sequence exists in this buffer, do nothing
   if (!buffer || !buffer.includes("\x1b_G")) {
     return buffer;
