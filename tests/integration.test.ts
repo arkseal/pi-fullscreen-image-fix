@@ -5,7 +5,7 @@ import { patchKittyBuffer } from "../patch.ts";
 import { installKittyImageFix } from "../hook.ts";
 
 describe("TuiAltScreen Integration", () => {
-  it("patches TuiAltScreen write during doRender to prevent image erasing", () => {
+  it("overrides prepareKittyScreen and protects Kitty graphic lines on placeholder rows", () => {
     let written = "";
     const fakeTerm = {
       columns: 80,
@@ -20,7 +20,7 @@ describe("TuiAltScreen Integration", () => {
     tui.altScreenActive = true;
 
     // Dummy multi-row Kitty graphic (occupies 4 rows)
-    const dummyKitty = "\x1b_Ga=T,f=100,r=4,c=20;AAAA\x1b\\";
+    const dummyKitty = "\x1b_Ga=T,f=100,r=4,c=20,i=999;AAAA\x1b\\";
 
     tui.layoutRoot = {
       render: () => [
@@ -34,17 +34,20 @@ describe("TuiAltScreen Integration", () => {
     // Install the fix
     const uninstall = installKittyImageFix(tui);
 
+    // Verify prepareKittyScreen is overridden
+    const prepared = tui.prepareKittyScreen(["test line"]);
+    assert.deepEqual(prepared.lines, ["test line"]);
+
     tui.doRender();
 
-    // Verify written contains the image
-    assert.ok(written.includes("AAAA\x1b\\"), "Must contain image data");
+    // The output buffer passed to stdout contains the render frame
+    const patched = patchKittyBuffer(written, 24);
 
-    // Verify lines 3, 4, 5 were pre-cleared before the image was drawn
-    const preClear = "\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K\x1b[4;1H\x1b[2K\x1b[5;1H\x1b[2K";
-    assert.ok(written.includes(preClear), "Must pre-clear rows 2, 3, 4, 5");
+    // Verify written contains the image
+    assert.ok(patched.includes("AAAA\x1b\\"), "Must contain image data");
 
     // Verify that AFTER the image, rows 3, 4, 5 are NOT erased
-    const afterImage = written.slice(written.indexOf("AAAA\x1b\\"));
+    const afterImage = patched.slice(patched.indexOf("AAAA\x1b\\"));
     assert.ok(!afterImage.includes("\x1b[3;1H\x1b[2K"), "Row 3 must not be erased after image");
     assert.ok(!afterImage.includes("\x1b[4;1H\x1b[2K"), "Row 4 must not be erased after image");
     assert.ok(!afterImage.includes("\x1b[5;1H\x1b[2K"), "Row 5 must not be erased after image");

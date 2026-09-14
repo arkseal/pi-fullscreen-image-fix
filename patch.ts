@@ -7,28 +7,25 @@
  * to allocate layout height.
  *
  * During TuiAltScreen.doRender(), every row is drawn using:
- *   \x1b[${row + 1};1H\x1b[2K${line}
+ *   \x1b[${row + 1};1H\x1b[2K${line} (or \x1b[<mainWidth>X from pi-sidebar-tui)
  *
- * When rows N+1..N+rows-1 are processed, \x1b[2K (Erase Line) or \x1b[<N>X (from
- * pi-sidebar-tui) is emitted on the empty placeholders. In terminals supporting
- * the Kitty graphics protocol (Ghostty, Kitty, WezTerm), clearing cells deletes
- * the graphic intersecting those cells. This wipes out rows 2..rows of the image,
- * leaving only the very first terminal row (about 2 pixel rows for a 64x64 image).
+ * When rows N+1..N+rows-1 are processed, the erase command destroys the Kitty graphic
+ * slice intersecting those cells in Kitty/Ghostty/WezTerm. This wipes out rows 2..rows
+ * of the image, leaving only the very first terminal row (2-pixel slit-scan artifact).
  *
- * Furthermore, when scrolling, Pi's prepareKittyScreen downgrades the image to an
- * a=p (placement-only) command without payload. Terminal emulators like WezTerm
- * do not reliably re-render placements after placement deletion (\x1b_Ga=d,d=a).
+ * Furthermore, when scrolling:
+ * 1. Pi converts the graphic to a placement-only sequence (a=p) without the image payload.
+ *    WezTerm fails to resolve placements after placement deletion (a=d,d=a).
+ * 2. If an extension or fix introduces full-line erases (\x1b[2K), it wipes out the sidebar
+ *    columns (e.g. cols 119..159), breaking the sidebar layout.
  *
  * Solution:
  * 1. Cache image payloads from a=T transmissions by image ID.
- * 2. When a=p placement is encountered on scroll, restore it to a=T so the terminal
- *    receives a direct, self-contained graphic command.
- * 3. Pre-clear all lines that the image will occupy before emitting the graphic.
- * 4. Suppress line erases (\x1b[2K and \x1b[<N>X) on placeholder rows N+1..N+rows-1,
- *    while preserving cursor coordinates, styling resets, and sync markers (\x1b[?2026l).
+ * 2. On scroll frames, rewrite a=p placements back to full a=T commands with the cached payload.
+ * 3. On placeholder rows N+1..N+rows-1, strip ONLY the leading erase command (\x1b[2K or \x1b[<N>X),
+ *    preserving all cursor coordinates, text, styling resets, and sync markers.
+ * 4. Never inject \x1b[2K or pre-clear sequences, protecting the sidebar columns from erasure.
  */
-
-import * as fs from "node:fs";
 
 export interface PatchStats {
   framesProcessed: number;
@@ -146,8 +143,8 @@ export function detectEraseCommand(content: string): string {
  * Patch a terminal write buffer to protect Kitty images from being cleared by
  * subsequent placeholder line erases.
  *
- * @param buffer Raw terminal escape sequences destined for terminal.write()
- * @param maxRows Maximum valid terminal row (to prevent out-of-bounds line clears)
+ * @param buffer Raw terminal escape sequences destined for stdout
+ * @param maxRows Maximum valid terminal row
  */
 export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
   stats.framesProcessed++;
@@ -156,7 +153,7 @@ export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
     return buffer;
   }
 
-  // Restore a=p placements to a=T using cached payloads
+  // Restore a=p placements to full a=T transmissions using cached payloads
   buffer = trackAndRewriteKittyPlacements(buffer);
 
   // Split on row-positioning escape sequences: \x1b[<row>;1H
@@ -176,41 +173,30 @@ export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
       const rowNum = parseInt(part.slice(2, -3), 10);
       const nextContent = parts[i + 1] || "";
 
-      // Case 1: Check if nextContent contains a Kitty image placement/transmission
-      const rows = extractKittyRows(nextContent);
-      if (rows > 1) {
-        kittyEndRow = Math.max(kittyEndRow, rowNum + rows - 1);
-        const clampedEnd = Math.min(kittyEndRow, maxRows);
-        const eraseCmd = detectEraseCommand(nextContent);
-
-        // Pre-clear all lines that the image will occupy
-        const preClear: string[] = [];
-        for (let r = rowNum; r <= clampedEnd; r++) {
-          preClear.push(`\x1b[${r};1H${eraseCmd}`);
+      // Case 1: Start of a Kitty graphic placement
+      if (nextContent.includes("\x1b_G")) {
+        const rows = extractKittyRows(nextContent);
+        if (rows > 1) {
+          kittyEndRow = Math.max(kittyEndRow, rowNum + rows - 1);
+          // Keep the image start row intact: it already has the appropriate line erase
+          // (e.g. \x1b[118X from sidebar) followed by the image sequence.
+          newParts.push(part);
+          newParts.push(nextContent);
+          i++; // consumed nextContent
+          continue;
         }
-        newParts.push(preClear.join(""));
-
-        // Move cursor back to the start row for the image
-        newParts.push(part);
-
-        // Strip the redundant leading erase from nextContent
-        const strippedContent = nextContent.replace(/^\x1b\[(?:[0-2]?K|\d+X)/, "");
-        newParts.push(strippedContent);
-
-        didPatch = true;
-        stats.imagesPatched++;
-        i++; // consumed nextContent
-        continue;
       }
 
-      // Case 2: We are on a row covered by an active Kitty graphic
+      // Case 2: Placeholder row covered by the active Kitty graphic
       if (rowNum <= kittyEndRow) {
-        // Strip the line-erase command so cells and image pixels are not destroyed,
-        // while preserving any styling resets, cursor positioning, or end-of-frame markers.
+        // Strip ONLY the leading line-erase command (\x1b[2K or \x1b[<N>X)
+        // so that cell graphics are not wiped out.
+        // Preserve all ANSI resets, cursor positions, and sync markers.
         const strippedContent = nextContent.replace(/^\x1b\[(?:[0-2]?K|\d+X)/, "");
         newParts.push(part);
         newParts.push(strippedContent);
         didPatch = true;
+        stats.imagesPatched++;
         i++; // consumed nextContent
         continue;
       }
