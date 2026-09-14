@@ -40,7 +40,7 @@ export const stats: PatchStats = {
  */
 export function extractKittyRows(content: string): number {
   if (!content || !content.includes("\x1b_G")) return 0;
-  const match = /\x1b_G([^;]*);/.exec(content);
+  const match = /\x1b_G([^\x1b;]*)(?:;|\x1b\\)/.exec(content);
   if (!match) return 0;
   const rMatch = /(?:^|,)r=(\d+)(?:,|$)/.exec(match[1]);
   return rMatch ? parseInt(rMatch[1], 10) : 1;
@@ -58,7 +58,7 @@ export function extractKittyRows(content: string): number {
  */
 export function isEraseOnly(content: string): boolean {
   if (!content) return true;
-  return /^(?:\x1b\[(?:[0-2]?K|\d+X)|\s)*$/.test(content);
+  return /^(?:\x1b\[(?:[0-2]?K|\d+X)|\x1b\[0m|\x1b\]8;;(?:\x07|\x1b\\)|\s)*$/.test(content);
 }
 
 /**
