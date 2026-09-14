@@ -16,15 +16,18 @@
  * Furthermore, completely removing the erase command leaves stale text from previous turns
  * visible to the right of the image (columns c+1..mainWidth).
  *
- * The Fix:
- * Whenever a write buffer contains a Kitty graphics sequence (\x1b_G), we detect
- * the number of rows (r) and columns (c) reserved for the image.
- *
- * On rows covered by the graphic (rows N+1..N+rows-1):
- * - We preserve columns 1..c so image graphic pixels are NEVER erased.
- * - We reposition the cursor to column c+1 and erase columns c+1..mainWidth (\x1b[<mainWidth-c>X
- *   or \x1b[K), cleanly wiping stale text to the right of the image without touching the sidebar.
- * - All cursor coordinates, styling resets, text lines, and sync markers are preserved.
+ * The Fix (Purely Local Two-Pass Architecture):
+ * 1. Pass 1: Scan the incoming write buffer for all Kitty graphic transmissions (a=T)
+ *    and placements (a=p) to find their exact row extent [startRow..endRow] and column width (cols).
+ * 2. Pass 2: For each row in the buffer:
+ *    - If the row is covered as a placeholder under an image, rewrite the leading line-erase
+ *      to start AFTER the image columns: `\x1b[${row};${cols + 1}H\x1b[${rem}X`.
+ *      Columns 1..cols (the image graphic) are NEVER erased.
+ *      Columns cols+1..mainWidth (stale text area) are cleanly erased.
+ *      Columns mainWidth+1..termWidth (the sidebar) are untouched.
+ *    - If the row is not covered by an image, it is preserved completely unmodified.
+ * 3. Fully stateless: No module-level state leaks between frames, ensuring 100% accuracy
+ *    during scrolling, fast viewport jumps, and multiple simultaneous images.
  */
 
 export interface PatchStats {
@@ -39,13 +42,11 @@ export const stats: PatchStats = {
   imagesPatched: 0,
 };
 
-export interface ActiveKitty {
+export interface ImageRegion {
   startRow: number;
   endRow: number;
   cols: number;
 }
-
-let activeKitty: ActiveKitty | null = null;
 
 /**
  * Extract dimensions (rows, cols) from a Kitty graphics sequence.
@@ -69,13 +70,6 @@ export function extractKittyDims(content: string): { rows: number; cols: number 
 }
 
 /**
- * Reset tracked active Kitty graphic state (useful in tests or when screen clears).
- */
-export function resetActiveKitty(): void {
-  activeKitty = null;
-}
-
-/**
  * Patch a terminal write buffer to protect Kitty images from being cleared by
  * subsequent placeholder line erases, while wiping stale text to the right of the image.
  *
@@ -85,17 +79,8 @@ export function resetActiveKitty(): void {
 export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
   stats.framesProcessed++;
 
-  if (!buffer) {
-    return buffer;
-  }
-
-  // If buffer deletes all placements or clears full screen, reset active image state
-  if (buffer.includes("\x1b_Ga=d,d=a") || buffer.includes("\x1b_Ga=d,d=A") || buffer.includes("\x1b[2J")) {
-    activeKitty = null;
-  }
-
-  // Fast path: if no Kitty graphics sequence exists and no active image, do nothing
-  if (!buffer.includes("\x1b_G") && !activeKitty) {
+  // Fast path: if no Kitty graphics sequence exists in this buffer, do nothing
+  if (!buffer || !buffer.includes("\x1b_G")) {
     return buffer;
   }
 
@@ -105,6 +90,30 @@ export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
     return buffer;
   }
 
+  // Pass 1: Discover all image regions defined in THIS frame
+  const imageRegions: ImageRegion[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part.startsWith("\x1b[") && part.endsWith(";1H")) {
+      const rowNum = parseInt(part.slice(2, -3), 10);
+      const nextContent = parts[i + 1] || "";
+      const dims = extractKittyDims(nextContent);
+      if (dims) {
+        imageRegions.push({
+          startRow: rowNum,
+          endRow: Math.min(rowNum + dims.rows - 1, maxRows),
+          cols: dims.cols,
+        });
+      }
+    }
+  }
+
+  // If no multi-row image was found in this buffer, return unmodified
+  if (imageRegions.length === 0) {
+    return buffer;
+  }
+
+  // Pass 2: Rewrite erases for rows covered by active images in this frame
   let didPatch = false;
   const newParts: string[] = [];
 
@@ -115,31 +124,20 @@ export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
       const rowNum = parseInt(part.slice(2, -3), 10);
       const nextContent = parts[i + 1] || "";
 
-      // Case 1: Start of a multi-row Kitty graphic placement or transmission
-      const dims = extractKittyDims(nextContent);
-      if (dims) {
-        activeKitty = {
-          startRow: rowNum,
-          endRow: Math.min(rowNum + dims.rows - 1, maxRows),
-          cols: dims.cols,
-        };
-        newParts.push(part);
-        newParts.push(nextContent);
-        i++; // consumed nextContent
-        continue;
-      }
+      // Find if this row is covered as a placeholder by ANY image in this frame
+      const covering = imageRegions.find(
+        (img) => rowNum > img.startRow && rowNum <= img.endRow
+      );
 
-      // Case 2: Row covered by the active Kitty graphic
-      if (activeKitty && rowNum > activeKitty.startRow && rowNum <= activeKitty.endRow) {
-        // Rewrite the leading erase to start AFTER the image columns (cols + 1)
-        // so image cells 1..cols are NOT erased, but stale text on cols+1..mainWidth IS erased.
+      if (covering) {
         const match = nextContent.match(/^\x1b\[(?:[0-2]?K|(\d+)X)/);
         if (match) {
           const totalWidth = match[1] ? parseInt(match[1], 10) : 118;
-          const rem = Math.max(0, totalWidth - activeKitty.cols);
+          const rem = Math.max(0, totalWidth - covering.cols);
           const eraseCmd = match[1] ? `\x1b[${rem}X` : "\x1b[K";
           const rest = nextContent.slice(match[0].length);
-          const rewritten = `\x1b[${rowNum};${activeKitty.cols + 1}H${eraseCmd}${rest}`;
+          // Position cursor to start after the image (cols + 1) and erase the rest of main area
+          const rewritten = `\x1b[${rowNum};${covering.cols + 1}H${eraseCmd}${rest}`;
           newParts.push(rewritten);
           didPatch = true;
           stats.imagesPatched++;

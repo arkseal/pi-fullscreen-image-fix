@@ -29,7 +29,7 @@ export function installGlobalStdoutHook(): void {
   ) {
     const str = typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString("utf8") : "";
 
-    if (!inHook && (str.includes("\x1b_G") || str.includes(";1H"))) {
+    if (!inHook && str.includes("\x1b_G")) {
       inHook = true;
       try {
         const maxRows = process.stdout.rows || 9999;

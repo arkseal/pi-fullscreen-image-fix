@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import {
   extractKittyDims,
   patchKittyBuffer,
-  resetActiveKitty,
   stats,
 } from "../patch.ts";
 
@@ -34,7 +33,6 @@ describe("extractKittyDims", () => {
 
 describe("patchKittyBuffer", () => {
   beforeEach(() => {
-    resetActiveKitty();
     stats.framesProcessed = 0;
     stats.framesPatched = 0;
     stats.imagesPatched = 0;
@@ -100,18 +98,62 @@ describe("patchKittyBuffer", () => {
     assert.equal(stats.framesPatched, 1);
   });
 
-  it("resets active image when placements are deleted or full screen is cleared", () => {
-    // Initial placement
-    const f1 = "\x1b[2;1H\x1b[118X\x1b_Ga=T,c=37,r=3;IMG\x1b\\\x1b[3;1H\x1b[118X\x1b[4;1H\x1b[118X";
+  it("is completely stateless between frames so scroll adjustments never leak stale rows", () => {
+    // Frame 1: Image at rows 2..5
+    const f1 = [
+      "\x1b[2;1H\x1b[118X\x1b_Ga=T,c=37,r=4;IMG\x1b\\",
+      "\x1b[3;1H\x1b[118X",
+      "\x1b[4;1H\x1b[118X",
+      "\x1b[5;1H\x1b[118X",
+    ].join("");
     patchKittyBuffer(f1, 24);
 
-    // Frame that deletes placements
-    const f2 = "\x1b_Ga=d,d=a,q=2\x1b\\\x1b[2;1H\x1b[118XText\x1b[3;1H\x1b[118XText\x1b[4;1H\x1b[118XText";
+    // Frame 2: Image scrolled down to rows 4..7 (rows 2 and 3 now have normal text!)
+    const f2 = [
+      "\x1b_Ga=d,d=a,q=2\x1b\\",
+      "\x1b[2;1H\x1b[118XNormal Text 2",
+      "\x1b[3;1H\x1b[118XNormal Text 3",
+      "\x1b[4;1H\x1b[118X\x1b_Ga=p,q=2,C=1,c=37,r=4,i=1\x1b\\",
+      "\x1b[5;1H\x1b[118X",
+      "\x1b[6;1H\x1b[118X",
+      "\x1b[7;1H\x1b[118X",
+    ].join("");
     const out2 = patchKittyBuffer(f2, 24);
 
-    // Since placements were deleted and no new graphic is placed, rows 2, 3, 4 should not be altered
-    assert.ok(out2.includes("\x1b[3;1H\x1b[118XText"));
-    assert.ok(out2.includes("\x1b[4;1H\x1b[118XText"));
+    // Rows 2 and 3 must NOT be treated as image placeholders; they must retain column 1 erase
+    assert.ok(out2.includes("\x1b[2;1H\x1b[118XNormal Text 2"), "Row 2 must not have stale image offset");
+    assert.ok(out2.includes("\x1b[3;1H\x1b[118XNormal Text 3"), "Row 3 must not have stale image offset");
+
+    // Rows 5..7 must have offset erase
+    assert.ok(out2.includes("\x1b[5;38H\x1b[81X"));
+    assert.ok(out2.includes("\x1b[6;38H\x1b[81X"));
+    assert.ok(out2.includes("\x1b[7;38H\x1b[81X"));
+  });
+
+  it("handles multiple Kitty images on the same screen", () => {
+    const input = [
+      "\x1b[2;1H\x1b[118X\x1b_Ga=T,c=20,r=2;IMG1\x1b\\",
+      "\x1b[3;1H\x1b[118X", // placeholder for IMG1
+      "\x1b[4;1H\x1b[118XText in between",
+      "\x1b[5;1H\x1b[118X\x1b_Ga=T,c=30,r=3;IMG2\x1b\\",
+      "\x1b[6;1H\x1b[118X", // placeholder for IMG2
+      "\x1b[7;1H\x1b[118X", // placeholder for IMG2
+      "\x1b[8;1H\x1b[118XFooter",
+    ].join("");
+
+    const output = patchKittyBuffer(input, 24);
+
+    // IMG1 covers rows 2..3, cols=20 -> row 3 erased from col 21
+    assert.ok(output.includes("\x1b[3;21H\x1b[98X"));
+
+    // Text in between is unmodified
+    assert.ok(output.includes("\x1b[4;1H\x1b[118XText in between"));
+
+    // IMG2 covers rows 5..7, cols=30 -> rows 6 and 7 erased from col 31
+    assert.ok(output.includes("\x1b[6;31H\x1b[88X"));
+    assert.ok(output.includes("\x1b[7;31H\x1b[88X"));
+
+    assert.ok(output.includes("\x1b[8;1H\x1b[118XFooter"));
   });
 
   it("is strictly idempotent", () => {
