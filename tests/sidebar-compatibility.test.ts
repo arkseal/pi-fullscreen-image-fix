@@ -37,7 +37,7 @@ describe("Sidebar Compatibility & Scrolling", () => {
     const img = new Image(png.toString("base64"), "image/png", { fallbackColor: s => s }, { maxWidthCells: 60 });
     const doc = {
       render: (w: number) => [
-        ...Array.from({ length: 10 }, (_, i) => `Line ${i}`),
+        ...Array.from({ length: 5 }, (_, i) => `Line ${i}`),
         ...img.render(w),
         ...Array.from({ length: 20 }, (_, i) => `After ${i}`),
       ],
@@ -57,17 +57,15 @@ describe("Sidebar Compatibility & Scrolling", () => {
     let combined = stdoutWrites.join("");
     assert.ok(!combined.includes("\x1b[2K"), "Must never emit \\x1b[2K across the screen");
     assert.ok(combined.includes("\x1b[118X"), "Must use width-limited erase \\x1b[118X for main area");
-    assert.ok(combined.includes("a=T"), "Must emit a=T on scroll");
-    assert.ok(!combined.includes("a=p"), "Must not leave placement-only a=p on scroll");
+    assert.ok(combined.includes("a=p"), "Uses lightweight placement command on scroll");
 
     // Scroll 2: Image is partially cropped at top (scrollTop > image row)
     stdoutWrites = [];
-    sv.scrollBy(12);
+    sv.scrollBy(10);
     tui.doRender();
 
     combined = stdoutWrites.join("");
     assert.ok(!combined.includes("\x1b[2K"), "Must never emit \\x1b[2K when cropped");
     assert.ok(combined.includes("\x1b[118X"), "Must keep width-limited erase when cropped");
-    assert.ok(combined.includes("a=T"), "Must emit a=T when cropped");
   });
 });

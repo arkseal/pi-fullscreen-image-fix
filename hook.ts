@@ -1,8 +1,8 @@
 import { patchKittyBuffer } from "./patch.ts";
 import * as fs from "node:fs";
 
-export const SYM_STDOUT_HOOKED = Symbol.for("pi_kitty_stdout_hooked_v2");
-export const SYM_PATCH_FN = Symbol.for("pi_kitty_patch_fn_v2");
+export const SYM_STDOUT_HOOKED = Symbol.for("pi_kitty_stdout_hooked_v3");
+export const SYM_PATCH_FN = Symbol.for("pi_kitty_patch_fn_v3");
 
 function debugLog(msg: string): void {
   try {
@@ -60,27 +60,12 @@ export function installGlobalStdoutHook(): void {
 /**
  * Installs the Kitty image protection hook.
  *
- * 1. Overrides `prepareKittyScreen` so Pi does not strip the base64 payload into
- *    a placement-only (a=p) sequence on scroll, preventing WezTerm placement lookup bugs.
- * 2. Ensures the single stdout hook is registered.
+ * Ensures the single stdout hook is registered.
  *
  * @param tui The TUI instance
  * @returns A cleanup function
  */
-export function installKittyImageFix(tui: any): () => void {
+export function installKittyImageFix(_tui?: any): () => void {
   installGlobalStdoutHook();
-
-  if (!tui) {
-    return () => {};
-  }
-
-  // Override prepareKittyScreen so Pi retains the full image payload instead
-  // of converting to placement-only (a=p) commands on scroll.
-  if (typeof tui.prepareKittyScreen === "function") {
-    tui.prepareKittyScreen = function (screen: string[]) {
-      return { lines: screen, evictedImageDeletion: "" };
-    };
-  }
-
   return () => {};
 }

@@ -5,7 +5,7 @@ import { patchKittyBuffer } from "../patch.ts";
 import { installKittyImageFix } from "../hook.ts";
 
 describe("TuiAltScreen Integration", () => {
-  it("overrides prepareKittyScreen and protects Kitty graphic lines on placeholder rows", () => {
+  it("protects Kitty graphic lines on placeholder rows during doRender", () => {
     let written = "";
     const fakeTerm = {
       columns: 80,
@@ -33,10 +33,6 @@ describe("TuiAltScreen Integration", () => {
 
     // Install the fix
     const uninstall = installKittyImageFix(tui);
-
-    // Verify prepareKittyScreen is overridden
-    const prepared = tui.prepareKittyScreen(["test line"]);
-    assert.deepEqual(prepared.lines, ["test line"]);
 
     tui.doRender();
 
