@@ -15,12 +15,20 @@
  * the graphic intersecting those cells. This wipes out rows 2..rows of the image,
  * leaving only the very first terminal row (about 2 pixel rows for a 64x64 image).
  *
+ * Furthermore, when scrolling, Pi's prepareKittyScreen downgrades the image to an
+ * a=p (placement-only) command without payload. Terminal emulators like WezTerm
+ * do not reliably re-render placements after placement deletion (\x1b_Ga=d,d=a).
+ *
  * Solution:
- * 1. When an image sequence with r > 1 is detected at row N, pre-clear all lines
- *    N..N+rows-1 before emitting the graphic.
- * 2. Reposition cursor back to row N and emit the Kitty graphic.
- * 3. Suppress subsequent line erases on the empty placeholder rows N+1..N+rows-1.
+ * 1. Cache image payloads from a=T transmissions by image ID.
+ * 2. When a=p placement is encountered on scroll, restore it to a=T so the terminal
+ *    receives a direct, self-contained graphic command.
+ * 3. Pre-clear all lines that the image will occupy before emitting the graphic.
+ * 4. Suppress line erases (\x1b[2K and \x1b[<N>X) on placeholder rows N+1..N+rows-1,
+ *    while preserving cursor coordinates, styling resets, and sync markers (\x1b[?2026l).
  */
+
+import * as fs from "node:fs";
 
 export interface PatchStats {
   framesProcessed: number;
@@ -33,6 +41,77 @@ export const stats: PatchStats = {
   framesPatched: 0,
   imagesPatched: 0,
 };
+
+const kittyPayloadCache = new Map<number, string>();
+const pendingPayloads = new Map<number, string>();
+
+/**
+ * Cache Kitty image payloads from a=T transmissions and rewrite a=p placements
+ * back to full a=T commands to bypass terminal emulator placement lookup bugs on scroll.
+ */
+export function trackAndRewriteKittyPlacements(buffer: string): string {
+  if (!buffer.includes("\x1b_G")) return buffer;
+
+  // 1. Capture image transmissions (a=T or a=t)
+  const regex = /\x1b_G([^\x1b;]+);([^\x1b]*)\x1b\\/g;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(buffer)) !== null) {
+    const controls = match[1];
+    const chunk = match[2];
+    const idMatch = /(?:^|,)i=(\d+)(?:,|$)/.exec(controls);
+    if (!idMatch) continue;
+    const id = parseInt(idMatch[1], 10);
+
+    const isChunked = /(?:^|,)m=1(?:,|$)/.test(controls);
+    const isLastChunk = /(?:^|,)m=0(?:,|$)/.test(controls);
+
+    if (isChunked) {
+      const prev = pendingPayloads.get(id) || "";
+      pendingPayloads.set(id, prev + chunk);
+    } else if (isLastChunk) {
+      const prev = pendingPayloads.get(id) || "";
+      kittyPayloadCache.set(id, prev + chunk);
+      pendingPayloads.delete(id);
+    } else {
+      kittyPayloadCache.set(id, chunk);
+      pendingPayloads.delete(id);
+    }
+  }
+
+  // 2. Rewrite a=p to a=T if we have the cached payload
+  return buffer.replace(/\x1b_G([^\x1b;]*a=p[^\x1b;]*)\x1b\\/g, (fullMatch, controls) => {
+    const idMatch = /(?:^|,)i=(\d+)(?:,|$)/.exec(controls);
+    if (!idMatch) return fullMatch;
+    const id = parseInt(idMatch[1], 10);
+    const payload = kittyPayloadCache.get(id);
+    if (!payload) return fullMatch;
+
+    let newControls = controls.replace(/(?:^|,)a=p(?:,|$)/, (m) => m.replace("a=p", "a=T"));
+    if (!/(?:^|,)f=\d+/.test(newControls)) {
+      newControls += ",f=100";
+    }
+
+    if (payload.length <= 4096) {
+      return `\x1b_G${newControls};${payload}\x1b\\`;
+    }
+
+    const CHUNK_SIZE = 4096;
+    const chunks: string[] = [];
+    for (let offset = 0; offset < payload.length; offset += CHUNK_SIZE) {
+      const slice = payload.slice(offset, offset + CHUNK_SIZE);
+      const isFirst = offset === 0;
+      const isLast = offset + CHUNK_SIZE >= payload.length;
+      if (isFirst) {
+        chunks.push(`\x1b_G${newControls},m=1;${slice}\x1b\\`);
+      } else if (isLast) {
+        chunks.push(`\x1b_Gm=0;${slice}\x1b\\`);
+      } else {
+        chunks.push(`\x1b_Gm=1;${slice}\x1b\\`);
+      }
+    }
+    return chunks.join("");
+  });
+}
 
 /**
  * Extract the number of terminal rows reserved for a Kitty image.
@@ -47,18 +126,12 @@ export function extractKittyRows(content: string): number {
 }
 
 /**
- * Test whether a row content is purely an erase command and optional whitespace,
- * with no actual text or visible content.
- *
- * Handles:
- * - \x1b[2K (ECMA-48 full line erase)
- * - \x1b[<N>X (erase characters from cursor, e.g. from pi-sidebar-tui)
- * - \x1b[0K, \x1b[1K, \x1b[K
- * - empty string or whitespace
+ * Test whether a row content is purely an erase command, resets, and whitespace,
+ * with no visible text content.
  */
 export function isEraseOnly(content: string): boolean {
   if (!content) return true;
-  return /^(?:\x1b\[(?:[0-2]?K|\d+X)|\x1b\[0m|\x1b\]8;;(?:\x07|\x1b\\)|\s)*$/.test(content);
+  return /^(?:\x1b\[(?:[0-2]?K|\d+X|\d+;\d+H|\?25[hl]|\?2026[hl])|\x1b\[0m|\x1b\]8;;(?:\x07|\x1b\\)|\s)*$/.test(content);
 }
 
 /**
@@ -79,15 +152,12 @@ export function detectEraseCommand(content: string): string {
 export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
   stats.framesProcessed++;
 
-  try {
-    const fs = require("node:fs");
-    fs.appendFileSync("/tmp/kitty-fix-debug.log", `[${new Date().toISOString()}] patchKittyBuffer called, hasKitty=${buffer.includes("\x1b_G")}, len=${buffer.length}\n`);
-  } catch {}
-
-  // Fast path: if no Kitty graphics sequence exists in this buffer, do nothing
   if (!buffer || !buffer.includes("\x1b_G")) {
     return buffer;
   }
+
+  // Restore a=p placements to a=T using cached payloads
+  buffer = trackAndRewriteKittyPlacements(buffer);
 
   // Split on row-positioning escape sequences: \x1b[<row>;1H
   const parts = buffer.split(/(\x1b\[\d+;1H)/);

@@ -233,4 +233,19 @@ describe("patchKittyBuffer", () => {
     assert.ok(!output.includes("\x1b[26;1H"), "Must not emit row 26");
     assert.ok(!output.includes("\x1b[27;1H"), "Must not emit row 27");
   });
+
+  it("restores a=p placements back to full a=T transmissions on scroll", () => {
+    // Frame 1: initial transmission
+    const frame1 = "\x1b[1;1H\x1b[2K\x1b_Ga=T,f=100,r=4,c=60,i=777;MY_IMAGE_BYTES\x1b\\\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K\x1b[4;1H\x1b[2K";
+    patchKittyBuffer(frame1, 24);
+
+    // Frame 2: scroll sends a=p without payload
+    const frame2 = "\x1b[2;1H\x1b[2K\x1b_Ga=p,q=2,C=1,c=60,r=4,i=777,y=2,h=62\x1b\\\x1b[3;1H\x1b[2K\x1b[4;1H\x1b[2K\x1b[5;1H\x1b[2K";
+    const out2 = patchKittyBuffer(frame2, 24);
+
+    // out2 must have been converted back to a=T and contain the original image payload
+    assert.ok(out2.includes("a=T"), "Must convert a=p to a=T");
+    assert.ok(out2.includes("MY_IMAGE_BYTES"), "Must include the cached image payload");
+    assert.ok(!out2.includes("a=p"), "Must not contain placement-only a=p");
+  });
 });

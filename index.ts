@@ -116,8 +116,10 @@ export default function fullscreenImageFixPlugin(pi: ExtensionAPI) {
     attachTuiWidget(ctx);
   });
 
-  // Also ensure widget is attached on tool results, in case the session was already running
-  // when the extension was hot-reloaded
+  pi.on("turn_start", (_event, ctx) => {
+    attachTuiWidget(ctx);
+  });
+
   pi.on("tool_result", (_event, ctx) => {
     attachTuiWidget(ctx);
   });

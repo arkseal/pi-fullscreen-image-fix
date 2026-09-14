@@ -38,7 +38,6 @@ export function installGlobalStdoutHook(): void {
       inHook = true;
       try {
         const maxRows = process.stdout.rows || 9999;
-        debugLog(`stdout.write intercepted \x1b_G, len=${chunk.length}, maxRows=${maxRows}`);
         chunk = patchKittyBuffer(chunk, maxRows);
       } catch (e: any) {
         debugLog(`patchKittyBuffer error: ${e?.message}`);
@@ -52,11 +51,13 @@ export function installGlobalStdoutHook(): void {
 
 /**
  * Installs the Kitty image protection hook onto a TuiAltScreen instance.
- * Intercepts terminal writes to ensure Kitty images are pre-cleared
- * and placeholder lines underneath them do not overwrite the graphic.
  *
- * @param tui The TUI instance (from ctx.ui.setWidget)
- * @returns A cleanup/uninstall function
+ * 1. Overrides `prepareKittyScreen` so Pi doesn't strip the base64 payload into
+ *    a placement-only (a=p) sequence on scroll, bypassing WezTerm's placement lookup bug.
+ * 2. Pre-clears rows and suppresses placeholder line-erases to prevent the 2-pixel sliver bug.
+ *
+ * @param tui The TUI instance
+ * @returns A cleanup function
  */
 export function installKittyImageFix(tui: any): () => void {
   installGlobalStdoutHook();
@@ -65,11 +66,13 @@ export function installKittyImageFix(tui: any): () => void {
     return () => {};
   }
 
-  if (tui[SYM_KITTY_FIX_INSTALLED]) {
-    return tui[SYM_KITTY_FIX_INSTALLED];
+  // Override prepareKittyScreen so Pi retains the full image payload instead
+  // of converting to placement-only (a=p) commands on scroll.
+  if (typeof tui.prepareKittyScreen === "function") {
+    tui.prepareKittyScreen = function (screen: string[]) {
+      return { lines: screen, evictedImageDeletion: "" };
+    };
   }
-
-  debugLog(`installKittyImageFix: tui.mode=${tui.mode}`);
 
   const terminal = tui.terminal;
   if (!terminal) {
@@ -78,7 +81,8 @@ export function installKittyImageFix(tui: any): () => void {
 
   // Hook terminal instance write
   const origTerminalWrite = terminal.write;
-  if (typeof origTerminalWrite === "function") {
+  if (typeof origTerminalWrite === "function" && !(terminal as any)[SYM_KITTY_FIX_INSTALLED]) {
+    (terminal as any)[SYM_KITTY_FIX_INSTALLED] = true;
     terminal.write = function (data: any) {
       if (typeof data === "string" && data.includes("\x1b_G")) {
         const maxRows = typeof terminal.rows === "number" ? terminal.rows : (process.stdout.rows || 9999);
@@ -97,17 +101,11 @@ export function installKittyImageFix(tui: any): () => void {
     proto.write = function (data: any) {
       if (typeof data === "string" && data.includes("\x1b_G")) {
         const maxRows = typeof this.rows === "number" ? this.rows : (process.stdout.rows || 9999);
-        debugLog(`proto.write intercepted \x1b_G, len=${data.length}, maxRows=${maxRows}`);
         data = patchKittyBuffer(data, maxRows);
       }
       return origProtoWrite.call(this, data);
     };
   }
 
-  const uninstall = () => {
-    delete tui[SYM_KITTY_FIX_INSTALLED];
-  };
-
-  tui[SYM_KITTY_FIX_INSTALLED] = uninstall;
-  return uninstall;
+  return () => {};
 }
