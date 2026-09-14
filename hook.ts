@@ -14,7 +14,7 @@ function debugLog(msg: string): void {
  * To prevent stale closures and multiple stacked wrappers across `/reload`:
  * 1. Resolves `realStdoutWrite` directly from `Object.getPrototypeOf(process.stdout).write`.
  * 2. Overwrites `process.stdout.write` directly with the fresh module implementation.
- * 3. Bypasses any previous wrappers so old closures cannot execute.
+ * 3. Handles both string and Buffer chunks seamlessly.
  */
 export function installGlobalStdoutHook(): void {
   const realStdoutWrite = Object.getPrototypeOf(process.stdout).write;
@@ -22,25 +22,21 @@ export function installGlobalStdoutHook(): void {
   debugLog("installGlobalStdoutHook: attaching fresh hook to process.stdout.write");
 
   let inHook = false;
-  let writeCount = 0;
   process.stdout.write = function (
     chunk: any,
     encodingOrCallback?: any,
     callback?: any
   ) {
-    writeCount++;
     const str = typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString("utf8") : "";
-    if (writeCount <= 20) {
-      debugLog(`write #${writeCount}: len=${chunk?.length ?? 0} isStr=${typeof chunk === "string"} isBuf=${Buffer.isBuffer(chunk)} preview=${JSON.stringify(str.slice(0, 40))}`);
-    }
 
-    if (!inHook && str.includes("\x1b_G")) {
+    if (!inHook && (str.includes("\x1b_G") || str.includes(";1H"))) {
       inHook = true;
       try {
-        debugLog(`stdout.write intercepted _G, len=${str.length}`);
         const maxRows = process.stdout.rows || 9999;
         const patched = patchKittyBuffer(str, maxRows);
-        chunk = Buffer.isBuffer(chunk) ? Buffer.from(patched, "utf8") : patched;
+        if (patched !== str) {
+          chunk = Buffer.isBuffer(chunk) ? Buffer.from(patched, "utf8") : patched;
+        }
       } catch (e: any) {
         debugLog(`patchKittyBuffer error: ${e?.message}`);
       } finally {

@@ -1,29 +1,30 @@
 /**
  * Pure buffer patching logic for Kitty graphics protocol in Pi fullscreen TUI.
  *
- * The Problem:
+ * Problem:
  * In Pi's fullscreen TUI (TuiAltScreen), the Image component renders a Kitty image
- * on row N with r=<rows> and outputs empty strings on rows N+1..N+rows-1 as placeholders
+ * on row N with r=<rows>, c=<cols> and outputs empty strings on rows N+1..N+rows-1 as placeholders
  * to allocate layout height.
  *
  * During TuiAltScreen.doRender(), every row is drawn using:
  *   \x1b[${row + 1};1H\x1b[2K${line} (or \x1b[<mainWidth>X from pi-sidebar-tui)
  *
  * When rows N+1..N+rows-1 are processed, the erase command destroys the Kitty graphic
- * slice intersecting those cells in Kitty/Ghostty/WezTerm. This wipes out rows 2..rows
- * of the image, leaving only the very first terminal row (2-pixel slit-scan artifact).
+ * slice intersecting those cells in WezTerm/Kitty/Ghostty. This wipes out rows 2..rows
+ * of the image, leaving only the very first terminal row (the 1-row slit-scan artifact).
+ *
+ * Furthermore, completely removing the erase command leaves stale text from previous turns
+ * visible to the right of the image (columns c+1..mainWidth).
  *
  * The Fix:
  * Whenever a write buffer contains a Kitty graphics sequence (\x1b_G), we detect
- * the number of rows reserved for the image (r=<rows>) from either transmission (a=T)
- * or placement (a=p) sequences.
+ * the number of rows (r) and columns (c) reserved for the image.
  *
- * For all subsequent rows covered by the graphic (rows N+1..N+rows-1), we strip ONLY
- * the leading line-erase command (\x1b[2K or \x1b[<N>X).
- *
- * All cursor coordinates, styling resets, text lines, and sync markers are preserved intact.
- * No synthetic line erases or pre-clears are ever injected, ensuring total compatibility
- * with pi-sidebar-tui and native 60fps scrolling without GPU vertex flooding.
+ * On rows covered by the graphic (rows N+1..N+rows-1):
+ * - We preserve columns 1..c so image graphic pixels are NEVER erased.
+ * - We reposition the cursor to column c+1 and erase columns c+1..mainWidth (\x1b[<mainWidth-c>X
+ *   or \x1b[K), cleanly wiping stale text to the right of the image without touching the sidebar.
+ * - All cursor coordinates, styling resets, text lines, and sync markers are preserved.
  */
 
 export interface PatchStats {
@@ -38,30 +39,45 @@ export const stats: PatchStats = {
   imagesPatched: 0,
 };
 
+export interface ActiveKitty {
+  startRow: number;
+  endRow: number;
+  cols: number;
+}
+
+let activeKitty: ActiveKitty | null = null;
+
 /**
- * Extract the number of terminal rows reserved for a Kitty image.
- * Inspects all Kitty sequences in the content to find any with an explicit r parameter.
- * Returns 0 if not a Kitty sequence, or >= 1 if found.
+ * Extract dimensions (rows, cols) from a Kitty graphics sequence.
  */
-export function extractKittyRows(content: string): number {
-  if (!content || !content.includes("\x1b_G")) return 0;
+export function extractKittyDims(content: string): { rows: number; cols: number } | null {
+  if (!content || !content.includes("\x1b_G")) return null;
   const regex = /\x1b_G([^\x1b;]*)(?:;|\x1b\\)/g;
   let m: RegExpExecArray | null;
   let maxRows = 0;
+  let maxCols = 0;
   while ((m = regex.exec(content)) !== null) {
-    const rMatch = /(?:^|,)r=(\d+)(?:,|$)/.exec(m[1]);
-    if (rMatch) {
-      maxRows = Math.max(maxRows, parseInt(rMatch[1], 10));
-    } else if (maxRows === 0) {
-      maxRows = 1;
-    }
+    const rM = /(?:^|,)r=(\d+)(?:,|$)/.exec(m[1]);
+    const cM = /(?:^|,)c=(\d+)(?:,|$)/.exec(m[1]);
+    if (rM) maxRows = Math.max(maxRows, parseInt(rM[1], 10));
+    if (cM) maxCols = Math.max(maxCols, parseInt(cM[1], 10));
   }
-  return maxRows;
+  if (maxRows > 1) {
+    return { rows: maxRows, cols: maxCols || 60 };
+  }
+  return null;
+}
+
+/**
+ * Reset tracked active Kitty graphic state (useful in tests or when screen clears).
+ */
+export function resetActiveKitty(): void {
+  activeKitty = null;
 }
 
 /**
  * Patch a terminal write buffer to protect Kitty images from being cleared by
- * subsequent placeholder line erases.
+ * subsequent placeholder line erases, while wiping stale text to the right of the image.
  *
  * @param buffer Raw terminal escape sequences destined for stdout
  * @param maxRows Maximum valid terminal row
@@ -69,8 +85,17 @@ export function extractKittyRows(content: string): number {
 export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
   stats.framesProcessed++;
 
-  // Fast path: if no Kitty graphics sequence exists in this buffer, do nothing
-  if (!buffer || !buffer.includes("\x1b_G")) {
+  if (!buffer) {
+    return buffer;
+  }
+
+  // If buffer deletes all placements or clears full screen, reset active image state
+  if (buffer.includes("\x1b_Ga=d,d=a") || buffer.includes("\x1b_Ga=d,d=A") || buffer.includes("\x1b[2J")) {
+    activeKitty = null;
+  }
+
+  // Fast path: if no Kitty graphics sequence exists and no active image, do nothing
+  if (!buffer.includes("\x1b_G") && !activeKitty) {
     return buffer;
   }
 
@@ -80,7 +105,6 @@ export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
     return buffer;
   }
 
-  let kittyEndRow = -1;
   let didPatch = false;
   const newParts: string[] = [];
 
@@ -91,32 +115,37 @@ export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
       const rowNum = parseInt(part.slice(2, -3), 10);
       const nextContent = parts[i + 1] || "";
 
-      // Case 1: Start of a Kitty graphic placement or transmission
-      if (nextContent.includes("\x1b_G")) {
-        const rows = extractKittyRows(nextContent);
-        if (rows > 1) {
-          kittyEndRow = Math.max(kittyEndRow, rowNum + rows - 1);
-          // Keep the image start row intact: it already has the appropriate line erase
-          // (e.g. \x1b[118X from sidebar) followed by the image sequence.
-          newParts.push(part);
-          newParts.push(nextContent);
+      // Case 1: Start of a multi-row Kitty graphic placement or transmission
+      const dims = extractKittyDims(nextContent);
+      if (dims) {
+        activeKitty = {
+          startRow: rowNum,
+          endRow: Math.min(rowNum + dims.rows - 1, maxRows),
+          cols: dims.cols,
+        };
+        newParts.push(part);
+        newParts.push(nextContent);
+        i++; // consumed nextContent
+        continue;
+      }
+
+      // Case 2: Row covered by the active Kitty graphic
+      if (activeKitty && rowNum > activeKitty.startRow && rowNum <= activeKitty.endRow) {
+        // Rewrite the leading erase to start AFTER the image columns (cols + 1)
+        // so image cells 1..cols are NOT erased, but stale text on cols+1..mainWidth IS erased.
+        const match = nextContent.match(/^\x1b\[(?:[0-2]?K|(\d+)X)/);
+        if (match) {
+          const totalWidth = match[1] ? parseInt(match[1], 10) : 118;
+          const rem = Math.max(0, totalWidth - activeKitty.cols);
+          const eraseCmd = match[1] ? `\x1b[${rem}X` : "\x1b[K";
+          const rest = nextContent.slice(match[0].length);
+          const rewritten = `\x1b[${rowNum};${activeKitty.cols + 1}H${eraseCmd}${rest}`;
+          newParts.push(rewritten);
+          didPatch = true;
+          stats.imagesPatched++;
           i++; // consumed nextContent
           continue;
         }
-      }
-
-      // Case 2: Placeholder row covered by the active Kitty graphic
-      if (rowNum <= kittyEndRow) {
-        // Strip ONLY the leading line-erase command (\x1b[2K or \x1b[<N>X)
-        // so that cell graphics are not wiped out.
-        // Preserve all ANSI resets, cursor positions, and sync markers.
-        const strippedContent = nextContent.replace(/^\x1b\[(?:[0-2]?K|\d+X)/, "");
-        newParts.push(part);
-        newParts.push(strippedContent);
-        didPatch = true;
-        stats.imagesPatched++;
-        i++; // consumed nextContent
-        continue;
       }
     }
 
