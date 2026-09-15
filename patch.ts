@@ -1,48 +1,37 @@
 /**
  * Pure buffer patching logic for Kitty graphics protocol in Pi fullscreen TUI.
  *
- * Problem:
- * In Pi's fullscreen TUI (TuiAltScreen), the Image component renders a Kitty image
- * on row N with r=<rows>, c=<cols> and outputs empty strings on rows N+1..N+rows-1 as placeholders
- * to allocate layout height.
+ * ## Problem:
+ * In Pi's fullscreen TUI (`TuiAltScreen`), images are rendered across multiple rows.
+ * The Image component outputs Kitty graphics escape sequences (`\x1b_Ga=...`) on row N,
+ * and empty strings on placeholder rows N+1..N+r-1 to allocate layout space.
  *
- * During TuiAltScreen.doRender(), every row is drawn sequentially from top to bottom:
- *   Row N:   \x1b[${N};1H\x1b[118X\x1b_Ga=...
- *   Row N+1: \x1b[${N+1};1H\x1b[118X
+ * When Pi renders a frame sequentially from top to bottom:
+ *   Row N:   \x1b[N;1H\x1b[118X\x1b_Ga=...
+ *   Row N+1: \x1b[N+1;1H\x1b[118X
  *   ...
- *   Row N+r: \x1b[${N+r};1H\x1b[118X
+ *   Row N+r: \x1b[N+r;1H\x1b[118X
  *
- * In WezTerm (and Kitty/Ghostty):
- * - Because the image is placed on Row N, subsequent row erases (\x1b[118X or \x1b[2K) on rows
- *   N+1..N+r-1 erase the graphic cells on those rows, causing the 1-row slit-scan artifact.
- * - If placeholder row erases are suppressed or offset, leftover text from previous turns remains
- *   in those cells, which pokes holes through the graphic in WezTerm (the "notch" artifact).
- * - If line-erase uses \x1b[K, it extends past column 118 and wipes the right sidebar.
+ * In terminals supporting cell-anchored Kitty graphics (WezTerm, Kitty, Ghostty):
+ * - Erasing rows N+1..N+r-1 deletes the intersecting graphic slices (1-2 row slit-scan artifact).
+ * - Leaving rows un-erased leaves stale characters in the cell grid, which poke holes through the
+ *   texture in WezTerm (the upper-left notch artifact).
+ * - Full-width erases (\x1b[2K or \x1b[K) destroy right-docked sidebars like pi-sidebar-tui.
  *
- * The Ultimate Fix (End-of-Frame Deferred Placement):
- * Rather than attempting to micro-manage line erases across individual placeholder rows:
- * 1. We extract all Kitty image sequences from the row drawing commands in the buffer.
- * 2. Every row (including Row N and placeholder rows N+1..N+r-1) is erased and drawn normally.
- *    - All cells are wiped clean of stale text.
- *    - The sidebar columns are completely preserved.
- * 3. AT THE VERY END OF THE FRAME (after all text and line erases have finished):
- *    We place the Kitty image at its target row using DECSC (\x1b7) and DECRC (\x1b8)
- *    to preserve the cursor position.
+ * ## Solution: End-of-Frame Deferred Placement
+ * 1. Let Pi and sidebar compositors draw and erase all terminal rows (1..rows) normally with
+ *    width-bounded erases (\x1b[118X). This wipes all cells clean of stale text and renders sidebar
+ *    areas without conflict.
+ * 2. Extract any Kitty graphic sequences from the row rendering commands.
+ * 3. Defer image placements to the very end of the synchronized output block (\x1b[?2026l) or buffer,
+ *    wrapping them in VT100 save cursor (\x1b7 DECSC) and restore cursor (\x1b8 DECRC).
  *
  * Result:
- * - The cells under the graphic are pristine and empty (no stale text holes / notch).
- * - No line erase ever runs after the graphic is placed (no slit-scan collapse).
- * - The sidebar is untouched.
- * - Smooth 60 FPS native scrolling.
+ * - Graphic slices are never erased because no row erase executes after image placement.
+ * - Underneath cells are freshly blanked, eliminating hole-punching / notch artifacts.
+ * - Sidebars remain completely untouched.
+ * - Native 60 FPS scrolling functions without heavy payload retransmission.
  */
-
-import * as fs from "node:fs";
-
-function debugLog(msg: string): void {
-  try {
-    fs.appendFileSync("/tmp/kitty-fix-debug.log", `[${new Date().toISOString()}] ${msg}\n`);
-  } catch {}
-}
 
 export interface PatchStats {
   framesProcessed: number;
@@ -56,8 +45,21 @@ export const stats: PatchStats = {
   imagesPatched: 0,
 };
 
+export function resetStats(): void {
+  stats.framesProcessed = 0;
+  stats.framesPatched = 0;
+  stats.imagesPatched = 0;
+}
+
+/** Matches ECMA-48 APC sequences used by the Kitty Graphics Protocol terminated by ST (\x1b\) or BEL (\x07). */
+const KITTY_APC_REGEX = /\x1b_G[\s\S]*?(?:\x1b\\|\x07)/g;
+
+/** Matches standard ANSI/VT cursor row-column positioning commands: \x1b[<row>;<col>H */
+const CURSOR_POS_REGEX = /(\x1b\[\d+;\d+H)/;
+
 /**
- * Patch a terminal write buffer by deferring Kitty graphic placements to the end of the frame.
+ * Transforms a terminal write buffer by deferring Kitty graphic placements to the end of the frame.
+ * If the buffer contains no Kitty sequences or is already patched, returns the input unchanged.
  */
 export function patchKittyBuffer(buffer: string): string {
   stats.framesProcessed++;
@@ -66,13 +68,13 @@ export function patchKittyBuffer(buffer: string): string {
     return buffer;
   }
 
-  // Split by row positioning escape sequences (\x1b[<row>;<col>H)
-  const parts = buffer.split(/(\x1b\[\d+;\d+H)/);
+  // Split by cursor positioning commands: \x1b[<row>;<col>H
+  const parts = buffer.split(CURSOR_POS_REGEX);
   if (parts.length < 3) {
     return buffer;
   }
 
-  // Find the last row command index
+  // Find the index of the last cursor row command
   let lastRowIdx = -1;
   for (let i = parts.length - 1; i >= 0; i--) {
     if (parts[i].startsWith("\x1b[") && parts[i].endsWith("H")) {
@@ -81,8 +83,8 @@ export function patchKittyBuffer(buffer: string): string {
     }
   }
 
-  // Idempotency: if all Kitty sequences are already at or after the last row command,
-  // this buffer was already patched.
+  // Idempotency check: if all Kitty sequences already reside at or after the last row command,
+  // this buffer was already patched and must not be wrapped again.
   let hasKittyBeforeLastRow = false;
   for (let i = 0; i < lastRowIdx; i++) {
     if (parts[i].includes("\x1b_G")) {
@@ -103,13 +105,12 @@ export function patchKittyBuffer(buffer: string): string {
     if (part.startsWith("\x1b[") && part.endsWith("H")) {
       const nextContent = parts[i + 1] || "";
       if (nextContent.includes("\x1b_G")) {
-        // Extract all Kitty sequences from nextContent
-        const kittyRegex = /\x1b_G(?:[^\x1b;]*;[^\x1b]*|[^\x1b]*)\x1b\\/g;
-        let m: RegExpExecArray | null;
-        while ((m = kittyRegex.exec(nextContent)) !== null) {
-          deferred.push({ pos: part, seq: m[0] });
+        let match: RegExpExecArray | null;
+        KITTY_APC_REGEX.lastIndex = 0;
+        while ((match = KITTY_APC_REGEX.exec(nextContent)) !== null) {
+          deferred.push({ pos: part, seq: match[0] });
         }
-        const stripped = nextContent.replace(kittyRegex, "");
+        const stripped = nextContent.replace(KITTY_APC_REGEX, "");
         newParts.push(part);
         newParts.push(stripped);
         i++; // consumed nextContent
@@ -126,9 +127,7 @@ export function patchKittyBuffer(buffer: string): string {
   stats.framesPatched++;
   stats.imagesPatched += deferred.length;
 
-  debugLog(`patchKittyBuffer: deferred ${deferred.length} image(s) to end of frame`);
-
-  // Build the deferred payload: save cursor (DECSC), place images, restore cursor (DECRC)
+  // Build the deferred payload: save cursor (DECSC), emit each image at its target coordinate, restore cursor (DECRC)
   let deferredPayload = "\x1b7";
   for (const item of deferred) {
     deferredPayload += `${item.pos}${item.seq}`;
@@ -137,8 +136,8 @@ export function patchKittyBuffer(buffer: string): string {
 
   let result = newParts.join("");
 
-  // Insert right before \x1b[?2026l (end of synchronized output) if present,
-  // otherwise append to the end of the buffer
+  // Place immediately before synchronized output termination (\x1b[?2026l) if present,
+  // otherwise append to the end of the frame buffer.
   const syncEndIdx = result.lastIndexOf("\x1b[?2026l");
   if (syncEndIdx !== -1) {
     result = result.slice(0, syncEndIdx) + deferredPayload + result.slice(syncEndIdx);
