@@ -11,7 +11,7 @@ function debugLog(msg: string): void {
   } catch {}
 }
 
-const SYM_RENDER_HOOKED = Symbol.for("pi_kitty_dorender_hooked");
+const SYM_ORIG_DORENDER = Symbol.for("pi_kitty_orig_dorender");
 
 /**
  * Installs the Kitty image protection fix onto a TuiAltScreen instance.
@@ -20,8 +20,10 @@ const SYM_RENDER_HOOKED = Symbol.for("pi_kitty_dorender_hooked");
  * or stopped scroll):
  * 1. It inspects the rendered layout screen lines to find all active Kitty images and their
  *    exact row extents and column widths.
- * 2. It wraps `terminal.write` for that single render cycle, rewriting placeholder line erases
- *    to preserve columns 1..cols while erasing cols+1..mainWidth.
+ * 2. It wraps `terminal.write` for that single render cycle:
+ *    - Pre-clears placeholder rows before the image is placed (eliminating stale text holes in WezTerm).
+ *    - Rewrites placeholder line-erases to preserve columns 1..cols while erasing cols+1..mainWidth.
+ *    - Preserves sidebar columns (columns mainWidth+1..termWidth) by never using \x1b[2K or \x1b[K.
  * 3. Restores `terminal.write` immediately in a finally block.
  */
 export function installKittyImageFix(tui: any): () => void {
@@ -31,14 +33,13 @@ export function installKittyImageFix(tui: any): () => void {
     return () => {};
   }
 
-  if (tui[SYM_RENDER_HOOKED]) {
-    return () => {};
+  if (!tui[SYM_ORIG_DORENDER]) {
+    tui[SYM_ORIG_DORENDER] = tui.doRender;
   }
-  tui[SYM_RENDER_HOOKED] = true;
+  const originalDoRender = tui[SYM_ORIG_DORENDER];
 
-  debugLog("installKittyImageFix: wrapping tui.doRender");
+  debugLog("installKittyImageFix: attaching doRender wrapper");
 
-  const originalDoRender = tui.doRender;
   tui.doRender = function (...args: any[]) {
     const term = this.terminal;
     const termCols = term?.columns || 118;
@@ -55,10 +56,10 @@ export function installKittyImageFix(tui: any): () => void {
     } catch {}
 
     const originalTermWrite = term?.write;
-    if (term && typeof originalTermWrite === "function" && imageRegions.length > 0) {
+    if (term && typeof originalTermWrite === "function") {
       term.write = function (data: any) {
         if (typeof data === "string") {
-          data = patchBufferWithRegions(data, imageRegions, termCols);
+          data = patchBufferWithRegions(data, imageRegions, termCols, termRows);
         }
         return originalTermWrite.call(this, data);
       };
@@ -73,7 +74,12 @@ export function installKittyImageFix(tui: any): () => void {
     }
   };
 
-  return () => {};
+  return () => {
+    if (tui && tui[SYM_ORIG_DORENDER]) {
+      tui.doRender = tui[SYM_ORIG_DORENDER];
+      delete tui[SYM_ORIG_DORENDER];
+    }
+  };
 }
 
 /**
@@ -93,8 +99,11 @@ export function installGlobalStdoutHook(): void {
     if (!inHook && str.includes("\x1b_G")) {
       inHook = true;
       try {
-        const maxRows = process.stdout.rows || 9999;
-        const patched = patchKittyBuffer(str, maxRows);
+        const maxRows = process.stdout.rows || 39;
+        const mainWidth = (process.stdout.columns && process.stdout.columns > 40)
+          ? process.stdout.columns - 41
+          : (process.stdout.columns || 118);
+        const patched = patchKittyBuffer(str, maxRows, mainWidth);
         if (patched !== str) {
           chunk = Buffer.isBuffer(chunk) ? Buffer.from(patched, "utf8") : patched;
         }

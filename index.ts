@@ -90,17 +90,21 @@ export default function fullscreenImageFixPlugin(pi: ExtensionAPI) {
   installGlobalStdoutHook();
 
   const attachTuiWidget = (ctx: any) => {
-    if (ctx?.mode !== "tui" || !ctx?.ui?.setWidget) return;
+    if (!ctx?.hasUI || !ctx?.ui?.setWidget) return;
 
     ctx.ui.setWidget(
       "pi-fullscreen-image-fix",
       (tui: any) => {
+        debugLog(`setWidget callback called: tui=${!!tui}, mode=${tui?.mode}`);
+        let cleanup: (() => void) | null = null;
         if (tui && tui.mode === "fullscreen") {
-          installKittyImageFix(tui);
+          cleanup = installKittyImageFix(tui);
         }
 
         return {
-          dispose() {},
+          dispose() {
+            cleanup?.();
+          },
           invalidate() {},
           render(_width: number): string[] {
             return [];
@@ -120,6 +124,10 @@ export default function fullscreenImageFixPlugin(pi: ExtensionAPI) {
     attachTuiWidget(ctx);
   });
 
+  pi.on("tool_call", (_event, ctx) => {
+    attachTuiWidget(ctx);
+  });
+
   pi.on("tool_result", (_event, ctx) => {
     attachTuiWidget(ctx);
   });
@@ -128,30 +136,28 @@ export default function fullscreenImageFixPlugin(pi: ExtensionAPI) {
   pi.registerCommand("image-fix", {
     description: "Check status of the fullscreen Kitty image rendering fix",
     handler: async (args, ctx) => {
+      attachTuiWidget(ctx);
+
       const sub = (args || "").trim().toLowerCase();
 
       if (sub === "test" || sub === "generate-test") {
         const testFilePath = path.join(ctx.cwd, "test-pattern-64x64.png");
         const pngBuf = generateTestPng(64, 64);
         fs.writeFileSync(testFilePath, pngBuf);
-        ctx.ui.notify(`Created 64x64 test image at ${testFilePath}. Use 'read test-pattern-64x64.png' to test rendering.`, "info");
+        ctx.ui?.notify?.(`Generated test PNG at ${testFilePath}`, "info");
         return;
       }
 
-      const statusMsg = [
-        "=== Fullscreen Image Fix Status ===",
-        `Stdout Hook: ACTIVE`,
-        `TUI Mode: ${ctx.mode}`,
-        `Frames Processed: ${stats.framesProcessed}`,
-        `Frames Patched: ${stats.framesPatched}`,
-        `Images Protected: ${stats.imagesPatched}`,
+      const report = [
+        "**Fullscreen Kitty Image Fix Status**",
+        `- Frames Processed: ${stats.framesProcessed}`,
+        `- Frames Patched: ${stats.framesPatched}`,
+        `- Image Placements Patched: ${stats.imagesPatched}`,
         "",
-        "Usage:",
-        "  /image-fix              Show this status",
-        "  /image-fix test         Generate 64x64 test image in current directory",
+        "Run `/image-fix test` to regenerate test-pattern-64x64.png.",
       ].join("\n");
 
-      ctx.ui.notify(statusMsg, "info");
+      ctx.ui?.notify?.(report, "info");
     },
   });
 }

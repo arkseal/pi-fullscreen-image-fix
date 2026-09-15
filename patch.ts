@@ -9,23 +9,34 @@
  * During TuiAltScreen.doRender(), every row is drawn using:
  *   \x1b[${row + 1};1H\x1b[2K${line} (or \x1b[<mainWidth>X from pi-sidebar-tui)
  *
- * When rows N+1..N+rows-1 are processed, the erase command destroys the Kitty graphic
- * slice intersecting those cells in WezTerm/Kitty/Ghostty. This wipes out rows 2..rows
- * of the image, leaving only the very first terminal row (the 1-row slit-scan artifact).
- *
- * Furthermore, completely removing the erase command leaves stale text from previous turns
- * visible to the right of the image (columns c+1..mainWidth).
+ * In WezTerm:
+ * 1. If rows N+1..N+rows-1 are erased with \x1b[2K or \x1b[118X, the graphic slice intersecting
+ *    those cells is destroyed, collapsing the image into a 1-row slit.
+ * 2. If the erase on rows N+1..N+rows-1 is simply omitted, stale text from previous turns in
+ *    columns 1..cols pokes holes through the graphic in WezTerm.
+ * 3. If an erase command uses \x1b[K instead of a bounded width \x1b[<rem>X, it erases past
+ *    column 118 and wipes the right sidebar.
  *
  * The Fix:
- * 1. For any multi-row Kitty image, we identify its exact row coverage [startRow..endRow]
- *    and column width (cols).
- * 2. For all placeholder rows (startRow+1..endRow):
- *    - Image cells (columns 1..cols) are NEVER erased.
- *    - The leading line-erase is rewritten to start at column cols+1:
- *      `\x1b[${row};${cols + 1}H\x1b[${rem}X` where rem = mainWidth - cols.
- *    - This cleanly wipes stale text to the right of the image without touching the graphic
- *      and without touching the sidebar (columns mainWidth+1..termWidth).
+ * 1. Pre-clear placeholder rows before placing the graphic:
+ *    Right before the Kitty image is transmitted/placed on row N, we pre-clear columns 1..mainWidth
+ *    on rows N+1..N+rows-1 with `\x1b[${r};1H\x1b[${mainWidth}X`.
+ *    This ensures the cells under the graphic contain only clean blank spaces, so stale text
+ *    cannot poke holes through the image in WezTerm.
+ * 2. Bounded erasure on placeholder rows:
+ *    When rows N+1..N+rows-1 are rendered, the line-erase is rewritten to:
+ *    `\x1b[${row};${cols + 1}H\x1b[${rem}X` where rem = mainWidth - cols.
+ *    This wipes stale text to the right of the image (columns cols+1..mainWidth) without
+ *    erasing the graphic (columns 1..cols) and without touching the sidebar (columns 119..termWidth).
  */
+
+import * as fs from "node:fs";
+
+function debugLog(msg: string): void {
+  try {
+    fs.appendFileSync("/tmp/kitty-fix-debug.log", `[${new Date().toISOString()}] ${msg}\n`);
+  } catch {}
+}
 
 export interface PatchStats {
   framesProcessed: number;
@@ -97,13 +108,23 @@ export function discoverImageRegionsFromScreen(
  * @param buffer Raw terminal escape sequences
  * @param imageRegions Active image regions on the screen
  * @param defaultMainWidth Width of the main area (e.g. 118)
+ * @param maxRows Number of visible terminal rows
  */
 export function patchBufferWithRegions(
   buffer: string,
   imageRegions: ImageRegion[],
-  defaultMainWidth = 118
+  defaultMainWidth = 118,
+  maxRows = 39
 ): string {
   if (imageRegions.length === 0 || !buffer) {
+    return buffer;
+  }
+
+  // If already patched for all regions, return early (idempotence)
+  const alreadyPatched = imageRegions.every((img) =>
+    buffer.includes(`\x1b[${img.startRow + 1};${img.cols + 1}H`)
+  );
+  if (alreadyPatched) {
     return buffer;
   }
 
@@ -122,6 +143,25 @@ export function patchBufferWithRegions(
       const rowNum = parseInt(part.slice(2, -3), 10);
       const nextContent = parts[i + 1] || "";
 
+      // Check if this row initiates a Kitty image transmission or placement
+      const dims = extractKittyDims(nextContent);
+      if (dims && dims.rows > 1) {
+        // Check if pre-clear was already applied in this buffer (for idempotency)
+        const expectedPreClear = `\x1b[${rowNum + 1};1H\x1b[${defaultMainWidth}X`;
+        const alreadyPreCleared = newParts.length > 0 && newParts[newParts.length - 1].includes(expectedPreClear);
+        if (!alreadyPreCleared) {
+          let preClear = "";
+          const endRow = Math.min(rowNum + dims.rows - 1, maxRows);
+          for (let r = rowNum + 1; r <= endRow; r++) {
+            preClear += `\x1b[${r};1H\x1b[${defaultMainWidth}X`;
+          }
+          preClear += `\x1b[${rowNum};1H`;
+          newParts.push(preClear);
+          didPatch = true;
+        }
+      }
+
+      // Check if this row is covered as a placeholder by ANY image in this frame
       const covering = imageRegions.find(
         (img) => rowNum > img.startRow && rowNum <= img.endRow
       );
@@ -158,7 +198,7 @@ export function patchBufferWithRegions(
  * Fallback buffer patcher that self-discovers image regions from Kitty sequences
  * within the buffer itself (used for stdout writes).
  */
-export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
+export function patchKittyBuffer(buffer: string, maxRows = 9999, defaultMainWidth = 118): string {
   stats.framesProcessed++;
 
   if (!buffer || !buffer.includes("\x1b_G")) {
@@ -192,5 +232,5 @@ export function patchKittyBuffer(buffer: string, maxRows = 9999): string {
     return buffer;
   }
 
-  return patchBufferWithRegions(buffer, imageRegions);
+  return patchBufferWithRegions(buffer, imageRegions, defaultMainWidth, maxRows);
 }

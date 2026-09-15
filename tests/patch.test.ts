@@ -68,10 +68,17 @@ describe("patchKittyBuffer", () => {
     assert.ok(output.includes("\x1b[5;38H\x1b[81Xold stale text"), "Row 5 must erase from col 38");
     assert.ok(output.includes("\x1b[6;38H\x1b[81Xold stale text"), "Row 6 must erase from col 38");
 
-    // 3. Image columns 1..37 must NOT have an erase command at column 1
-    assert.ok(!output.includes("\x1b[4;1H\x1b[118X"));
-    assert.ok(!output.includes("\x1b[5;1H\x1b[118X"));
-    assert.ok(!output.includes("\x1b[6;1H\x1b[118X"));
+    // 3. Image columns 1..37 must NOT have an erase command at column 1 after the image is placed
+    const afterImage = output.slice(output.indexOf("IMG\x1b\\"));
+    assert.ok(!afterImage.includes("\x1b[4;1H\x1b[118X"));
+    assert.ok(!afterImage.includes("\x1b[5;1H\x1b[118X"));
+    assert.ok(!afterImage.includes("\x1b[6;1H\x1b[118X"));
+
+    // 4. Placeholder rows must be pre-cleared before the image is placed to prevent stale text holes
+    const beforeImage = output.slice(0, output.indexOf("IMG\x1b\\"));
+    assert.ok(beforeImage.includes("\x1b[4;1H\x1b[118X"));
+    assert.ok(beforeImage.includes("\x1b[5;1H\x1b[118X"));
+    assert.ok(beforeImage.includes("\x1b[6;1H\x1b[118X"));
 
     // 4. Content outside image must be preserved
     assert.ok(output.includes("\x1b[7;1H\x1b[118XLine 7"));
