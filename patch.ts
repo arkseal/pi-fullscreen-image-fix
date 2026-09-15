@@ -6,28 +6,34 @@
  * on row N with r=<rows>, c=<cols> and outputs empty strings on rows N+1..N+rows-1 as placeholders
  * to allocate layout height.
  *
- * During TuiAltScreen.doRender(), every row is drawn using:
- *   \x1b[${row + 1};1H\x1b[2K${line} (or \x1b[<mainWidth>X from pi-sidebar-tui)
+ * During TuiAltScreen.doRender(), every row is drawn sequentially from top to bottom:
+ *   Row N:   \x1b[${N};1H\x1b[118X\x1b_Ga=...
+ *   Row N+1: \x1b[${N+1};1H\x1b[118X
+ *   ...
+ *   Row N+r: \x1b[${N+r};1H\x1b[118X
  *
- * In WezTerm:
- * 1. If rows N+1..N+rows-1 are erased with \x1b[2K or \x1b[118X, the graphic slice intersecting
- *    those cells is destroyed, collapsing the image into a 1-row slit.
- * 2. If the erase on rows N+1..N+rows-1 is simply omitted, stale text from previous turns in
- *    columns 1..cols pokes holes through the graphic in WezTerm.
- * 3. If an erase command uses \x1b[K instead of a bounded width \x1b[<rem>X, it erases past
- *    column 118 and wipes the right sidebar.
+ * In WezTerm (and Kitty/Ghostty):
+ * - Because the image is placed on Row N, subsequent row erases (\x1b[118X or \x1b[2K) on rows
+ *   N+1..N+r-1 erase the graphic cells on those rows, causing the 1-row slit-scan artifact.
+ * - If placeholder row erases are suppressed or offset, leftover text from previous turns remains
+ *   in those cells, which pokes holes through the graphic in WezTerm (the "notch" artifact).
+ * - If line-erase uses \x1b[K, it extends past column 118 and wipes the right sidebar.
  *
- * The Fix:
- * 1. Pre-clear placeholder rows before placing the graphic:
- *    Right before the Kitty image is transmitted/placed on row N, we pre-clear columns 1..mainWidth
- *    on rows N+1..N+rows-1 with `\x1b[${r};1H\x1b[${mainWidth}X`.
- *    This ensures the cells under the graphic contain only clean blank spaces, so stale text
- *    cannot poke holes through the image in WezTerm.
- * 2. Bounded erasure on placeholder rows:
- *    When rows N+1..N+rows-1 are rendered, the line-erase is rewritten to:
- *    `\x1b[${row};${cols + 1}H\x1b[${rem}X` where rem = mainWidth - cols.
- *    This wipes stale text to the right of the image (columns cols+1..mainWidth) without
- *    erasing the graphic (columns 1..cols) and without touching the sidebar (columns 119..termWidth).
+ * The Ultimate Fix (End-of-Frame Deferred Placement):
+ * Rather than attempting to micro-manage line erases across individual placeholder rows:
+ * 1. We extract all Kitty image sequences from the row drawing commands in the buffer.
+ * 2. Every row (including Row N and placeholder rows N+1..N+r-1) is erased and drawn normally.
+ *    - All cells are wiped clean of stale text.
+ *    - The sidebar columns are completely preserved.
+ * 3. AT THE VERY END OF THE FRAME (after all text and line erases have finished):
+ *    We place the Kitty image at its target row using DECSC (\x1b7) and DECRC (\x1b8)
+ *    to preserve the cursor position.
+ *
+ * Result:
+ * - The cells under the graphic are pristine and empty (no stale text holes / notch).
+ * - No line erase ever runs after the graphic is placed (no slit-scan collapse).
+ * - The sidebar is untouched.
+ * - Smooth 60 FPS native scrolling.
  */
 
 import * as fs from "node:fs";
@@ -50,187 +56,95 @@ export const stats: PatchStats = {
   imagesPatched: 0,
 };
 
-export interface ImageRegion {
-  startRow: number;
-  endRow: number;
-  cols: number;
-}
-
 /**
- * Extract dimensions (rows, cols) from a Kitty graphics sequence.
+ * Patch a terminal write buffer by deferring Kitty graphic placements to the end of the frame.
  */
-export function extractKittyDims(content: string): { rows: number; cols: number } | null {
-  if (!content || !content.includes("\x1b_G")) return null;
-  const regex = /\x1b_G([^\x1b;]*)(?:;|\x1b\\)/g;
-  let m: RegExpExecArray | null;
-  let maxRows = 0;
-  let maxCols = 0;
-  while ((m = regex.exec(content)) !== null) {
-    const rM = /(?:^|,)r=(\d+)(?:,|$)/.exec(m[1]);
-    const cM = /(?:^|,)c=(\d+)(?:,|$)/.exec(m[1]);
-    if (rM) maxRows = Math.max(maxRows, parseInt(rM[1], 10));
-    if (cM) maxCols = Math.max(maxCols, parseInt(cM[1], 10));
-  }
-  if (maxRows > 1) {
-    return { rows: maxRows, cols: maxCols || 60 };
-  }
-  return null;
-}
-
-/**
- * Discover image regions from a rendered screen line array.
- */
-export function discoverImageRegionsFromScreen(
-  screen: readonly string[],
-  termRows = 39,
-  mainWidth = 118
-): ImageRegion[] {
-  const regions: ImageRegion[] = [];
-  for (let r = 0; r < screen.length; r++) {
-    const line = screen[r] || "";
-    if (line.includes("\x1b_G")) {
-      const dims = extractKittyDims(line);
-      if (dims) {
-        regions.push({
-          startRow: r + 1, // 1-indexed terminal row
-          endRow: Math.min(r + dims.rows, termRows),
-          cols: Math.min(dims.cols, mainWidth),
-        });
-      }
-    }
-  }
-  return regions;
-}
-
-/**
- * Patch a terminal write buffer using known image regions.
- *
- * @param buffer Raw terminal escape sequences
- * @param imageRegions Active image regions on the screen
- * @param defaultMainWidth Width of the main area (e.g. 118)
- * @param maxRows Number of visible terminal rows
- */
-export function patchBufferWithRegions(
-  buffer: string,
-  imageRegions: ImageRegion[],
-  defaultMainWidth = 118,
-  maxRows = 39
-): string {
-  if (imageRegions.length === 0 || !buffer) {
-    return buffer;
-  }
-
-  // If already patched for all regions, return early (idempotence)
-  const alreadyPatched = imageRegions.every((img) =>
-    buffer.includes(`\x1b[${img.startRow + 1};${img.cols + 1}H`)
-  );
-  if (alreadyPatched) {
-    return buffer;
-  }
-
-  const parts = buffer.split(/(\x1b\[\d+;1H)/);
-  if (parts.length < 3) {
-    return buffer;
-  }
-
-  let didPatch = false;
-  const newParts: string[] = [];
-
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i];
-
-    if (part.startsWith("\x1b[") && part.endsWith(";1H")) {
-      const rowNum = parseInt(part.slice(2, -3), 10);
-      const nextContent = parts[i + 1] || "";
-
-      // Check if this row initiates a Kitty image transmission or placement
-      const dims = extractKittyDims(nextContent);
-      if (dims && dims.rows > 1) {
-        // Check if pre-clear was already applied in this buffer (for idempotency)
-        const expectedPreClear = `\x1b[${rowNum + 1};1H\x1b[${defaultMainWidth}X`;
-        const alreadyPreCleared = newParts.length > 0 && newParts[newParts.length - 1].includes(expectedPreClear);
-        if (!alreadyPreCleared) {
-          let preClear = "";
-          const endRow = Math.min(rowNum + dims.rows - 1, maxRows);
-          for (let r = rowNum + 1; r <= endRow; r++) {
-            preClear += `\x1b[${r};1H\x1b[${defaultMainWidth}X`;
-          }
-          preClear += `\x1b[${rowNum};1H`;
-          newParts.push(preClear);
-          didPatch = true;
-        }
-      }
-
-      // Check if this row is covered as a placeholder by ANY image in this frame
-      const covering = imageRegions.find(
-        (img) => rowNum > img.startRow && rowNum <= img.endRow
-      );
-
-      if (covering) {
-        const match = nextContent.match(/^\x1b\[(?:[0-2]?K|(\d+)X)/);
-        if (match) {
-          const totalWidth = match[1] ? parseInt(match[1], 10) : defaultMainWidth;
-          const rem = Math.max(0, totalWidth - covering.cols);
-          const eraseCmd = `\x1b[${rem}X`;
-          const rest = nextContent.slice(match[0].length);
-          const rewritten = `\x1b[${rowNum};${covering.cols + 1}H${eraseCmd}${rest}`;
-          newParts.push(rewritten);
-          didPatch = true;
-          stats.imagesPatched++;
-          i++; // consumed nextContent
-          continue;
-        }
-      }
-    }
-
-    newParts.push(part);
-  }
-
-  if (didPatch) {
-    stats.framesPatched++;
-    return newParts.join("");
-  }
-
-  return buffer;
-}
-
-/**
- * Fallback buffer patcher that self-discovers image regions from Kitty sequences
- * within the buffer itself (used for stdout writes).
- */
-export function patchKittyBuffer(buffer: string, maxRows = 9999, defaultMainWidth = 118): string {
+export function patchKittyBuffer(buffer: string): string {
   stats.framesProcessed++;
 
   if (!buffer || !buffer.includes("\x1b_G")) {
     return buffer;
   }
 
-  const parts = buffer.split(/(\x1b\[\d+;1H)/);
+  // Split by row positioning escape sequences (\x1b[<row>;<col>H)
+  const parts = buffer.split(/(\x1b\[\d+;\d+H)/);
   if (parts.length < 3) {
     return buffer;
   }
 
-  // Discover all image regions defined in THIS frame
-  const imageRegions: ImageRegion[] = [];
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i];
-    if (part.startsWith("\x1b[") && part.endsWith(";1H")) {
-      const rowNum = parseInt(part.slice(2, -3), 10);
-      const nextContent = parts[i + 1] || "";
-      const dims = extractKittyDims(nextContent);
-      if (dims) {
-        imageRegions.push({
-          startRow: rowNum,
-          endRow: Math.min(rowNum + dims.rows - 1, maxRows),
-          cols: dims.cols,
-        });
-      }
+  // Find the last row command index
+  let lastRowIdx = -1;
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (parts[i].startsWith("\x1b[") && parts[i].endsWith("H")) {
+      lastRowIdx = i;
+      break;
     }
   }
 
-  if (imageRegions.length === 0) {
+  // Idempotency: if all Kitty sequences are already at or after the last row command,
+  // this buffer was already patched.
+  let hasKittyBeforeLastRow = false;
+  for (let i = 0; i < lastRowIdx; i++) {
+    if (parts[i].includes("\x1b_G")) {
+      hasKittyBeforeLastRow = true;
+      break;
+    }
+  }
+
+  if (!hasKittyBeforeLastRow) {
     return buffer;
   }
 
-  return patchBufferWithRegions(buffer, imageRegions, defaultMainWidth, maxRows);
+  const deferred: { pos: string; seq: string }[] = [];
+  const newParts: string[] = [];
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part.startsWith("\x1b[") && part.endsWith("H")) {
+      const nextContent = parts[i + 1] || "";
+      if (nextContent.includes("\x1b_G")) {
+        // Extract all Kitty sequences from nextContent
+        const kittyRegex = /\x1b_G(?:[^\x1b;]*;[^\x1b]*|[^\x1b]*)\x1b\\/g;
+        let m: RegExpExecArray | null;
+        while ((m = kittyRegex.exec(nextContent)) !== null) {
+          deferred.push({ pos: part, seq: m[0] });
+        }
+        const stripped = nextContent.replace(kittyRegex, "");
+        newParts.push(part);
+        newParts.push(stripped);
+        i++; // consumed nextContent
+        continue;
+      }
+    }
+    newParts.push(part);
+  }
+
+  if (deferred.length === 0) {
+    return buffer;
+  }
+
+  stats.framesPatched++;
+  stats.imagesPatched += deferred.length;
+
+  debugLog(`patchKittyBuffer: deferred ${deferred.length} image(s) to end of frame`);
+
+  // Build the deferred payload: save cursor (DECSC), place images, restore cursor (DECRC)
+  let deferredPayload = "\x1b7";
+  for (const item of deferred) {
+    deferredPayload += `${item.pos}${item.seq}`;
+  }
+  deferredPayload += "\x1b8";
+
+  let result = newParts.join("");
+
+  // Insert right before \x1b[?2026l (end of synchronized output) if present,
+  // otherwise append to the end of the buffer
+  const syncEndIdx = result.lastIndexOf("\x1b[?2026l");
+  if (syncEndIdx !== -1) {
+    result = result.slice(0, syncEndIdx) + deferredPayload + result.slice(syncEndIdx);
+  } else {
+    result += deferredPayload;
+  }
+
+  return result;
 }

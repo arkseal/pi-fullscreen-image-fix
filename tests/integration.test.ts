@@ -47,7 +47,7 @@ describe("TuiAltScreen Integration", () => {
     assert.ok(!afterImage.includes("\x1b[3;1H\x1b[2K"), "Row 3 must not be erased after image");
     assert.ok(!afterImage.includes("\x1b[4;1H\x1b[2K"), "Row 4 must not be erased after image");
     assert.ok(!afterImage.includes("\x1b[5;1H\x1b[2K"), "Row 5 must not be erased after image");
-    assert.ok(afterImage.includes("Footer"), "Footer must be rendered");
+    assert.ok(patched.includes("Footer"), "Footer must be rendered");
 
     // Clean up
     uninstall();
