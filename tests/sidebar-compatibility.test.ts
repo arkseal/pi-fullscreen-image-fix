@@ -1,9 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { TuiAltScreen } from "@earendil-works/pi-tui";
-import { ScrollView } from "/home/aarush/.nvm/versions/node/v22.23.2/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui/dist/components/scroll-view.js";
-import { Image } from "/home/aarush/.nvm/versions/node/v22.23.2/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui/dist/components/image.js";
-import { setCapabilities } from "/home/aarush/.nvm/versions/node/v22.23.2/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui/dist/terminal-image.js";
+import { ScrollView } from "@earendil-works/pi-tui/dist/components/scroll-view.js";
+import { Image } from "@earendil-works/pi-tui/dist/components/image.js";
+import { setCapabilities } from "@earendil-works/pi-tui/dist/terminal-image.js";
 import { SidebarCompositor } from "/home/aarush/code/pi_plugins/pi-sidebar-tui/compositor.ts";
 import { generateTestPng } from "../index.ts";
 import { patchKittyBuffer } from "../patch.ts";
